@@ -30,6 +30,9 @@ Loss function (Hydra) is called as:
 and may return:
   - loss tensor
   - or (loss_tensor, metrics_dict)
+
+This file also supports adding KL from model output (e.g., ActOutput.kl or preds['kl'])
+with weight config.train.kl_weight (or config.agent.kl_weight fallback).
 """
 
 from __future__ import annotations
@@ -92,6 +95,41 @@ def _get_actions_pred(preds) -> torch.Tensor:
         "Model output must be a Tensor or a dict containing 'actions' or 'a_hat'. "
         f"Got type={type(preds)} keys={list(preds.keys()) if isinstance(preds, dict) else None}"
     )
+
+
+def _get_kl_from_preds(preds) -> Optional[torch.Tensor]:
+    """
+    Robustly extract KL term from model output.
+    Supports:
+      - ActOutput dataclass/object with `.kl`
+      - dict with 'kl' / 'vae_kl' / 'kl_loss'
+    """
+    if preds is None:
+        return None
+
+    # dataclass / object style (e.g., ActOutput)
+    if hasattr(preds, "kl"):
+        kl = getattr(preds, "kl")
+        if torch.is_tensor(kl):
+            return kl
+        return None
+
+    # dict style
+    if isinstance(preds, dict):
+        for k in ("kl", "vae_kl", "kl_loss"):
+            if k in preds and torch.is_tensor(preds[k]):
+                return preds[k]
+    return None
+
+
+def _loss_dict_has_kl(loss_dict: Dict[str, Any]) -> bool:
+    """
+    If loss_func already reports KL-like metrics, we assume it already included KL
+    (avoid double-count).
+    """
+    keys = set(loss_dict.keys())
+    kl_like = {"kl", "vae_kl", "kl_loss", "kld", "kl_div", "kl_divergence"}
+    return any(k in keys for k in kl_like)
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="train")
@@ -175,7 +213,6 @@ def main(config):
                 dataset_instantiate_config=config.benchmark.dataset_instantiate_config,
             )
         except TypeError:
-            # Fallback: evaluator doesn't accept dataset args
             evaluator = instantiate(
                 config=config.benchmark.evaluator_instantiate_config,
                 task_name=config.task_name,
@@ -210,7 +247,6 @@ def main(config):
     _, _, sample_robot_state, _, sample_action, _, _ = _unpack_batch(sample_batch)
 
     robot_state_dim = int(sample_robot_state.size(-1))
-    # works for [B,A] or [B,K,A]
     action_dim = int(sample_action.size(-1))
 
     Logger.log_info(f'Robot state dim: {colored(robot_state_dim, "red")}')
@@ -242,6 +278,17 @@ def main(config):
         config=config.train.scheduler_instantiate_config,
         optimizer=optimizer,
     )
+
+    # ----------------------------
+    # KL weight (ACT/DETR-VAE)
+    # ----------------------------
+    kl_weight = OmegaConf.select(config, "train.kl_weight", default=None)
+    if kl_weight is None:
+        kl_weight = OmegaConf.select(config, "agent.kl_weight", default=None)
+    if kl_weight is None:
+        kl_weight = OmegaConf.select(config, "agent.instantiate_config.kl_weight", default=0.0)
+    kl_weight = float(kl_weight)
+    Logger.log_info(f"KL weight: {colored(kl_weight, 'red')}")
 
     # ----------------------------
     # Training loop
@@ -287,10 +334,26 @@ def main(config):
             if isinstance(loss_result, tuple):
                 loss = loss_result[0]
                 loss_dict = loss_result[1]
-                for k, v in loss_dict.items():
-                    iteration_info[f"train_interation/{k}"] = _to_item(v)
+                if isinstance(loss_dict, dict):
+                    for k, v in loss_dict.items():
+                        iteration_info[f"train_interation/{k}"] = _to_item(v)
             else:
                 loss = loss_result
+
+            # ---- add KL (if model provides it and loss_func didn't already include it) ----
+            kl = _get_kl_from_preds(preds)
+            if kl_weight > 0.0 and kl is not None:
+                already_has_kl = False
+                if isinstance(loss_result, tuple):
+                    _, ld = loss_result
+                    if isinstance(ld, dict):
+                        already_has_kl = _loss_dict_has_kl(ld)
+
+                if not already_has_kl:
+                    loss = loss + kl_weight * kl
+                    iteration_info["train_interation/kl"] = _to_item(kl.detach())
+                    iteration_info["train_interation/kl_weight"] = kl_weight
+                    iteration_info["train_interation/loss_total_with_kl"] = _to_item(loss.detach())
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -350,11 +413,29 @@ def main(config):
                 else:
                     loss_result = call(config.benchmark.loss_func, preds, actions)
 
+                # ---- add KL for validation objective (consistent with training) ----
+                kl = _get_kl_from_preds(preds)
+                if kl_weight > 0.0 and kl is not None:
+                    already_has_kl = False
+                    if isinstance(loss_result, tuple):
+                        _, ld = loss_result
+                        if isinstance(ld, dict):
+                            already_has_kl = _loss_dict_has_kl(ld)
+
+                    if not already_has_kl:
+                        if isinstance(loss_result, tuple):
+                            loss_result = (loss_result[0] + kl_weight * kl, loss_result[1])
+                        else:
+                            loss_result = loss_result + kl_weight * kl
+                        epoch_logging_info["validation/kl"] = _to_item(kl.detach())
+                        epoch_logging_info["validation/kl_weight"] = kl_weight
+
                 if isinstance(loss_result, tuple):
                     loss_val.update(loss_result[0].item(), actions.shape[0])
                     loss_dict = loss_result[1]
-                    for k, v in loss_dict.items():
-                        epoch_logging_info[f"validation/{k}"] = _to_item(v)
+                    if isinstance(loss_dict, dict):
+                        for k, v in loss_dict.items():
+                            epoch_logging_info[f"validation/{k}"] = _to_item(v)
                 else:
                     loss_val.update(loss_result.item(), actions.shape[0])
 
@@ -382,7 +463,6 @@ def main(config):
                     }
                 )
 
-                # video if available
                 if getattr(evaluator, "env", None) is not None and hasattr(evaluator.env, "get_frames"):
                     try:
                         epoch_logging_info["validation/video_steps"] = wandb.Video(

@@ -37,13 +37,13 @@ def _log_warn(msg: str):
     elif hasattr(Logger, "log_warning"):
         Logger.log_warning(msg)
     else:
-        _log_info(f"[WARNING] {msg}")
+        print("[WARNING]", msg)
 
 def _print_sep():
     if hasattr(Logger, "print_seperator"):
         Logger.print_seperator()
     else:
-        print("-" * 120)
+        print("-" * 100)
 
 
 # ----------------------------
@@ -75,27 +75,18 @@ def _get_actions_pred(preds) -> torch.Tensor:
     """Extract action prediction tensor from model output."""
     if torch.is_tensor(preds):
         return preds
-
     if isinstance(preds, dict):
         for k in ("actions", "a_hat"):
             if k in preds and torch.is_tensor(preds[k]):
                 return preds[k]
         raise ValueError(f"Dict output has no tensor 'actions'/'a_hat'. keys={list(preds.keys())}")
-
+    # object (ActOutput)
     for attr in ("actions", "a_hat", "action", "pred_actions", "actions_hat"):
         if hasattr(preds, attr):
             v = getattr(preds, attr)
             if torch.is_tensor(v):
                 return v
-
-    keys = None
-    if hasattr(preds, "__dict__"):
-        keys = list(preds.__dict__.keys())
-    raise ValueError(
-        "Model output must be a Tensor, a dict containing 'actions'/'a_hat', "
-        "or an object with tensor attribute 'actions'/'a_hat'. "
-        f"Got type={type(preds)} attrs={keys}"
-    )
+    raise ValueError(f"Unsupported model output type={type(preds)}")
 
 
 # ----------------------------
@@ -126,7 +117,7 @@ def _resolve_checkpoint_path(ckpt_path: str) -> str:
     raise FileNotFoundError(f"Checkpoint path not found: {ckpt_path}")
 
 
-def _load_checkpoint(model: torch.nn.Module, ckpt_file: str, device: str) -> Dict[str, Any]:
+def _load_checkpoint(model: torch.nn.Module, ckpt_file: str) -> Dict[str, Any]:
     obj = torch.load(ckpt_file, map_location="cpu")
 
     if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
@@ -141,168 +132,115 @@ def _load_checkpoint(model: torch.nn.Module, ckpt_file: str, device: str) -> Dic
     state_dict = _strip_prefix_if_present(state_dict, prefixes=("module.", "model."))
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
+    summary = {
+        "missing_keys_count": len(missing),
+        "unexpected_keys_count": len(unexpected),
+        "missing_keys_preview": missing[:30],
+        "unexpected_keys_preview": unexpected[:30],
+    }
     if missing:
         _log_warn(f"Missing keys: {len(missing)} (show up to 30)\n{missing[:30]}")
     if unexpected:
         _log_warn(f"Unexpected keys: {len(unexpected)} (show up to 30)\n{unexpected[:30]}")
-
-    model.to(device)
-
-    return {
-        "missing_keys_count": int(len(missing)),
-        "unexpected_keys_count": int(len(unexpected)),
-        "missing_keys_preview": missing[:30] if missing else [],
-        "unexpected_keys_preview": unexpected[:30] if unexpected else [],
-    }
+    return summary
 
 
 # ----------------------------
-# Diagnostics helpers
+# Diagnostics + plots
 # ----------------------------
-def _unique_rows_rounded(x: np.ndarray, decimals: int = 8) -> int:
-    rr = np.round(x.astype(np.float64), decimals=decimals)
-    return int(np.unique(rr, axis=0).shape[0])
+def _drop_pad(a_pred: np.ndarray, a_gt: np.ndarray, pad: Optional[np.ndarray]):
+    # a_*: [K,A]
+    if pad is None:
+        return a_pred, a_gt, a_pred.shape[0]
+    valid = ~pad.astype(bool)
+    a_pred2 = a_pred[valid]
+    a_gt2 = a_gt[valid]
+    return a_pred2, a_gt2, int(valid.sum())
 
-def _variation_curves(a: np.ndarray) -> Dict[str, np.ndarray]:
+
+def diagnose_chunk(pred: np.ndarray, gt: np.ndarray, eps_abs: float = 1e-6, repeat_ratio_thresh: float = 1e-3) -> Dict[str, Any]:
     """
-    a: [K,A]
-    returns:
-      l2_from0[t] = ||a[t]-a[0]||
-      l2_step[t]  = ||a[t]-a[t-1]|| for t>=1
+    pred/gt: [K,A]
     """
-    K = a.shape[0]
-    diff0 = a - a[0:1]
-    l2_from0 = np.linalg.norm(diff0, axis=1)
-    if K > 1:
-        step = a[1:] - a[:-1]
-        l2_step = np.linalg.norm(step, axis=1)
-    else:
-        l2_step = np.zeros((0,), dtype=np.float64)
-    return {"l2_from0": l2_from0, "l2_step": l2_step}
+    K, A = pred.shape
+    # absolute diag (numerical)
+    step_change = np.abs(np.diff(pred, axis=0))          # [K-1,A]
+    max_step_change_abs = float(step_change.max()) if K > 1 else 0.0
+    pred_std = np.std(pred, axis=0)                      # [A]
+    gt_std = np.std(gt, axis=0)
+    max_std_over_time_dim = float(pred_std.max())
+    looks_repeat_abs = (max_step_change_abs < eps_abs) or (max_std_over_time_dim < eps_abs)
 
-def diagnose_chunk_absolute(a_pred: np.ndarray, eps_abs: float) -> Dict[str, Any]:
-    """
-    Absolute diagnosis: tells if pred changes over time at all (numerically).
-    """
-    K, A = a_pred.shape
-    if K <= 1:
-        return {"K": int(K), "A": int(A), "looks_repeat_abs": True, "eps_abs": float(eps_abs)}
+    # relative diag (compared to GT)
+    pred_l2_from0 = np.linalg.norm(pred - pred[0:1], axis=1)   # [K]
+    gt_l2_from0 = np.linalg.norm(gt - gt[0:1], axis=1)
+    pred_l2_from0_max = float(pred_l2_from0.max())
+    gt_l2_from0_max = float(gt_l2_from0.max())
+    variation_ratio_pred_over_gt = float(pred_l2_from0_max / (gt_l2_from0_max + 1e-12))
 
-    step_diff = a_pred[1:] - a_pred[:-1]
-    max_step_change_abs = float(np.max(np.abs(step_diff)))
-    std_over_time = np.std(a_pred, axis=0)
-    max_std_dim = float(np.max(std_over_time))
-    uniq = _unique_rows_rounded(a_pred, decimals=8)
+    std_ratio = pred_std / (gt_std + 1e-12)
+    std_ratio_max = float(std_ratio.max())
+    std_ratio_mean = float(std_ratio.mean())
 
-    looks_repeat_abs = (max_step_change_abs <= eps_abs) or (max_std_dim <= eps_abs) or (uniq <= 2)
+    looks_like_repeat_relative = variation_ratio_pred_over_gt < repeat_ratio_thresh
 
-    return {
+    abs_diag = {
         "K": int(K),
         "A": int(A),
         "max_step_change_abs": max_step_change_abs,
-        "max_std_over_time_dim": max_std_dim,
-        "unique_rows_rounded_8dp": int(uniq),
+        "max_std_over_time_dim": max_std_over_time_dim,
         "looks_repeat_abs": bool(looks_repeat_abs),
         "eps_abs": float(eps_abs),
     }
-
-def diagnose_chunk_relative_to_gt(a_pred: np.ndarray, a_gt: np.ndarray, repeat_ratio_thresh: float = 1e-3) -> Dict[str, Any]:
-    """
-    Relative diagnosis (recommended):
-      If pred time-variation is tiny compared to gt time-variation, treat as "repeat" in practice.
-    """
-    assert a_pred.shape == a_gt.shape, f"pred {a_pred.shape} vs gt {a_gt.shape}"
-    K, A = a_pred.shape
-
-    pred_std = np.std(a_pred, axis=0)
-    gt_std = np.std(a_gt, axis=0)
-    std_ratio = pred_std / (gt_std + 1e-12)
-
-    pred_range = np.max(a_pred, axis=0) - np.min(a_pred, axis=0)
-    gt_range = np.max(a_gt, axis=0) - np.min(a_gt, axis=0)
-    range_ratio = pred_range / (gt_range + 1e-12)
-
-    vp = _variation_curves(a_pred)
-    vg = _variation_curves(a_gt)
-
-    pred_l2_from0_max = float(np.max(vp["l2_from0"])) if K > 0 else 0.0
-    gt_l2_from0_max = float(np.max(vg["l2_from0"])) if K > 0 else 0.0
-    variation_ratio = pred_l2_from0_max / (gt_l2_from0_max + 1e-12)
-
-    looks_repeat_rel = (variation_ratio < repeat_ratio_thresh) and (float(np.max(std_ratio)) < repeat_ratio_thresh * 10)
-
-    return {
-        "K": int(K),
-        "A": int(A),
-        "pred_std_max": float(np.max(pred_std)),
-        "pred_std_mean": float(np.mean(pred_std)),
-        "gt_std_max": float(np.max(gt_std)),
-        "gt_std_mean": float(np.mean(gt_std)),
-        "std_ratio_max": float(np.max(std_ratio)),
-        "std_ratio_mean": float(np.mean(std_ratio)),
-        "pred_range_max": float(np.max(pred_range)),
-        "pred_range_mean": float(np.mean(pred_range)),
-        "gt_range_max": float(np.max(gt_range)),
-        "gt_range_mean": float(np.mean(gt_range)),
-        "range_ratio_max": float(np.max(range_ratio)),
-        "range_ratio_mean": float(np.mean(range_ratio)),
+    rel_diag = {
         "pred_l2_from0_max": pred_l2_from0_max,
         "gt_l2_from0_max": gt_l2_from0_max,
-        "variation_ratio_pred_over_gt": variation_ratio,
+        "variation_ratio_pred_over_gt": variation_ratio_pred_over_gt,
+        "pred_std_max": float(pred_std.max()),
+        "gt_std_max": float(gt_std.max()),
+        "std_ratio_max": std_ratio_max,
+        "std_ratio_mean": std_ratio_mean,
         "repeat_ratio_thresh": float(repeat_ratio_thresh),
-        "looks_like_repeat_relative_to_gt": bool(looks_repeat_rel),
+        "looks_like_repeat_relative_to_gt": bool(looks_like_repeat_relative),
     }
+    return {"abs_diag": abs_diag, "rel_diag": rel_diag}
 
-def plot_pred_gt_variation(a_pred: np.ndarray, a_gt: np.ndarray, save_path: str, title: str):
-    """
-    Single figure: pred and gt variation curves together.
-    If pred is "flat" you will see pred curves near 0 while gt curves are larger.
-    """
-    vp = _variation_curves(a_pred)
-    vg = _variation_curves(a_gt)
-    K = a_pred.shape[0]
 
-    fig = plt.figure(figsize=(12, 4))
-    ax = fig.add_subplot(111)
-
-    ax.plot(np.arange(K), vp["l2_from0"], label="pred: L2(pred[t]-pred[0])", alpha=0.9)
-    ax.plot(np.arange(K), vg["l2_from0"], label="gt:   L2(gt[t]-gt[0])", alpha=0.9)
-
-    if K > 1:
-        ax.plot(np.arange(1, K), vp["l2_step"], label="pred: L2(pred[t]-pred[t-1])", alpha=0.9)
-        ax.plot(np.arange(1, K), vg["l2_step"], label="gt:   L2(gt[t]-gt[t-1])", alpha=0.9)
-
-    ax.set_title(title)
-    ax.set_xlabel("timestep")
-    ax.set_ylabel("L2 norm")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.savefig(save_path, dpi=200)
-    plt.close(fig)
-
-def plot_actions_1d(pred: np.ndarray, gt: np.ndarray, save_path: str, title: str):
-    T = pred.shape[0]
-    A = pred.shape[1]
-    time = np.arange(T)
-
-    fig, axes = plt.subplots(A, 1, figsize=(14, 2.3 * A), sharex=True)
+def plot_actions(pred: np.ndarray, gt: np.ndarray, save_path: str, title: str):
+    K, A = pred.shape
+    t = np.arange(K)
+    fig, axes = plt.subplots(A, 1, figsize=(14, 2.2 * A), sharex=True)
     if A == 1:
         axes = [axes]
     fig.suptitle(title)
-
     for i in range(A):
         ax = axes[i]
-        ax.plot(time, pred[:, i], label="pred", alpha=0.8)
-        ax.plot(time, gt[:, i], label="gt", alpha=0.8)
-        mse = float(np.mean((pred[:, i] - gt[:, i]) ** 2))
-        mae = float(np.mean(np.abs(pred[:, i] - gt[:, i])))
-        ax.set_ylabel(f"dim {i}")
-        ax.set_title(f"MSE={mse:.6f}, MAE={mae:.6f}")
+        ax.plot(t, pred[:, i], label="pred", alpha=0.9)
+        ax.plot(t, gt[:, i], label="gt", alpha=0.9)
         ax.grid(True, alpha=0.3)
+        ax.set_ylabel(f"dim {i}")
         ax.legend()
-
-    axes[-1].set_xlabel("timestep")
+    axes[-1].set_xlabel("k")
     plt.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_variation(pred: np.ndarray, gt: np.ndarray, save_path: str, title: str):
+    # std over time, per-dim
+    pred_std = np.std(pred, axis=0)
+    gt_std = np.std(gt, axis=0)
+    x = np.arange(pred.shape[1])
+
+    fig = plt.figure(figsize=(14, 4))
+    ax = fig.add_subplot(111)
+    ax.plot(x, pred_std, marker="o", label="pred_std_over_k")
+    ax.plot(x, gt_std, marker="o", label="gt_std_over_k")
+    ax.set_title(title)
+    ax.set_xlabel("action_dim")
+    ax.set_ylabel("std over chunk (k)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
 
@@ -312,7 +250,7 @@ def plot_actions_1d(pred: np.ndarray, gt: np.ndarray, save_path: str, title: str
 # ----------------------------
 @hydra.main(version_base=None, config_path="../config", config_name="train")
 def main(config):
-    _log_info(f"[INFO] Plot eval with {colored(pathlib.Path(__file__).absolute(), 'red')}")
+    _log_info(f"[INFO] Inference eval with {colored(pathlib.Path(__file__).absolute(), 'red')}")
     _log_info(f"[INFO] Task: {colored(config.task_name, 'green')}")
     _log_info(f"[INFO] Dataset dir: {colored(config.dataset_dir, 'green')}")
     _log_info(f"[INFO] Device: {colored(config.device, 'green')}")
@@ -328,16 +266,12 @@ def main(config):
     ckpt_path = getattr(eval_cfg, "checkpoint_path", None) if eval_cfg is not None else None
     if ckpt_path is None and eval_cfg is not None:
         ckpt_path = getattr(eval_cfg, "ckpt_path", None)
-
-    plot_index = int(getattr(eval_cfg, "plot_index", 0)) if eval_cfg is not None else 0
-    debug_shapes = bool(getattr(eval_cfg, "debug_shapes", True)) if eval_cfg is not None else True
-
-    # diagnosis knobs
-    eps_abs = float(getattr(eval_cfg, "chunk_eps_abs", 1e-6)) if eval_cfg is not None else 1e-6
-    repeat_ratio_thresh = float(getattr(eval_cfg, "repeat_ratio_thresh", 1e-3)) if eval_cfg is not None else 1e-3
-
     if ckpt_path is None:
         raise ValueError("Please provide checkpoint path via +evaluation.checkpoint_path=...")
+
+    plot_index = getattr(eval_cfg, "plot_index", 0) if eval_cfg is not None else 0
+    eps_abs = float(getattr(eval_cfg, "chunk_eps_abs", 1e-6)) if eval_cfg is not None else 1e-6
+    repeat_ratio_thresh = float(getattr(eval_cfg, "repeat_ratio_thresh", 1e-3)) if eval_cfg is not None else 1e-3
 
     ckpt_file = _resolve_checkpoint_path(ckpt_path)
     _log_info(f"[INFO] Using checkpoint: {colored(ckpt_file, 'green')}")
@@ -374,23 +308,10 @@ def main(config):
 
     robot_state_dim = int(robot_states.size(-1))
     action_dim = int(actions.size(-1))
-    gt_K = int(actions.size(1)) if actions.ndim == 3 else 1
-
+    gt_K = int(actions.size(1)) if actions.dim() == 3 else 1
     _log_info(f"[INFO] Robot state dim: {robot_state_dim}")
     _log_info(f"[INFO] Action dim: {action_dim}")
-    _log_info(f"[INFO] GT chunk K (from dataset actions): {gt_K}")
-
-    if debug_shapes:
-        _log_info(f"[DEBUG] images shape={tuple(images.shape)}")
-        _log_info(f"[DEBUG] point_clouds shape={tuple(point_clouds.shape)}")
-        _log_info(f"[DEBUG] robot_states shape={tuple(robot_states.shape)}")
-        if torch.is_tensor(raw_states):
-            _log_info(f"[DEBUG] raw_states tensor shape={tuple(raw_states.shape)}")
-        else:
-            _log_info(f"[DEBUG] raw_states type={type(raw_states)}")
-        _log_info(f"[DEBUG] actions shape={tuple(actions.shape)}")
-        if is_pad is not None:
-            _log_info(f"[DEBUG] is_pad shape={tuple(is_pad.shape)}")
+    _log_info(f"[INFO] GT chunk K: {gt_K}")
 
     # model
     model = instantiate(
@@ -399,7 +320,7 @@ def main(config):
         action_dim=action_dim,
     ).to(config.device)
 
-    ckpt_summary = _load_checkpoint(model, ckpt_file=ckpt_file, device=config.device)
+    ckpt_summary = _load_checkpoint(model, ckpt_file)
     _log_info(f"[INFO] ckpt load summary: missing={ckpt_summary['missing_keys_count']}, unexpected={ckpt_summary['unexpected_keys_count']}")
 
     model.eval()
@@ -411,145 +332,115 @@ def main(config):
     if is_pad is not None:
         is_pad = is_pad.to(config.device)
 
-    # forward
+    # ----------------------------
+    # Forward A: posterior (TRAIN-LIKE) 传 actions
+    # ----------------------------
     with torch.no_grad():
-        try:
-            preds = model(images, point_clouds, robot_states, texts, actions=actions, is_pad=is_pad)
-        except TypeError:
-            preds = model(images, point_clouds, robot_states, texts)
+        preds_post = model(images, point_clouds, robot_states, texts, actions=actions, is_pad=is_pad)
+    a_post = _get_actions_pred(preds_post).detach().cpu().numpy()  # [1,K,A]
+    a_gt = actions.detach().cpu().numpy()
 
-    a_pred = _get_actions_pred(preds)
-    _log_info(f"[INFO] RAW model pred tensor shape: {tuple(a_pred.shape)}")
+    a_post = a_post[0] if a_post.ndim == 3 else a_post
+    a_gt_np = a_gt[0] if a_gt.ndim == 3 else a_gt
 
-    # move to numpy
-    a_pred_np = a_pred.detach().cpu().numpy()
-    a_gt_np = actions.detach().cpu().numpy()
-    pad_np = is_pad.detach().cpu().numpy()[0] if (is_pad is not None and is_pad.ndim >= 2) else None
+    pad_np = is_pad.detach().cpu().numpy()[0] if is_pad is not None else None
+    a_post, a_gt_np_post, K_valid = _drop_pad(a_post, a_gt_np, pad_np)
 
-    # --------- normalize to [K,A] if possible (but never tile a single-step pred) ----------
-    mode = None
+    plot_actions(
+        a_post, a_gt_np_post,
+        save_path=str(out_dir / f"plot_idx{plot_index:05d}_actions_posterior.png"),
+        title=f"Posterior (train-like, with GT actions) | split={split} | idx={plot_index}"
+    )
 
-    if a_pred_np.ndim == 3:
-        # [B,K,A]
-        mode = "pred_is_chunk"
-        a_pred_np = a_pred_np[0]
-        a_gt_np = a_gt_np[0]
-        if pad_np is not None:
-            valid = ~pad_np.astype(bool)
-            a_pred_np = a_pred_np[valid]
-            a_gt_np = a_gt_np[valid]
+    mse_post = float(np.mean((a_post - a_gt_np_post) ** 2))
+    mae_post = float(np.mean(np.abs(a_post - a_gt_np_post)))
+    _log_info(f"[POSTERIOR] K_valid={K_valid} mse={mse_post:.6e} mae={mae_post:.6e}")
 
-    elif a_pred_np.ndim == 2:
-        # could be [B,A] or already [K,A]
-        if a_pred_np.shape[0] == gt_K and a_pred_np.shape[1] == action_dim:
-            mode = "pred_is_chunk_2d"
-            # here a_gt_np is [1,K,A], take [0]
-            a_gt_np = a_gt_np[0]
-        else:
-            mode = "pred_is_single_step"
-            _log_warn(
-                f"Pred is 2D {a_pred_np.shape} but GT is chunk K={gt_K}. "
-                "This indicates the model is single-step, not predicting 50 steps."
-            )
-            # save quick single-step proof and exit
-            pred0 = a_pred_np[0]
-            gt0 = a_gt_np[0, 0]
-            mse0 = float(np.mean((pred0 - gt0) ** 2))
-            mae0 = float(np.mean(np.abs(pred0 - gt0)))
-            _log_info(f"[DIAG] single-step vs gt[0]: MSE={mse0:.6f}, MAE={mae0:.6f}")
+    # ----------------------------
+    # Forward B: inference (REAL) 不传 actions
+    # ----------------------------
+    with torch.no_grad():
+        preds_inf = model(images, point_clouds, robot_states, texts)
+    a_inf = _get_actions_pred(preds_inf).detach().cpu().numpy()
 
-            out = {
-                "mode": mode,
-                "gt_K": gt_K,
-                "raw_pred_shape": list(a_pred.shape),
-                "single_step_mse_vs_gt0": mse0,
-                "single_step_mae_vs_gt0": mae0,
-                "ckpt_summary": ckpt_summary,
-            }
-            with open(out_dir / f"plot_idx{plot_index:05d}_chunk_diagnosis.json", "w") as f:
-                json.dump(out, f, indent=2)
+    _log_info(f"[INFO] RAW model pred tensor shape: {tuple(a_inf.shape)}")
 
-            fig = plt.figure(figsize=(12, 4))
-            ax = fig.add_subplot(111)
-            ax.plot(pred0, label="pred_step0", marker="o", alpha=0.9)
-            ax.plot(gt0, label="gt_step0", marker="o", alpha=0.9)
-            ax.set_title(f"Single-step pred vs gt[0] | idx={plot_index} | MSE={mse0:.6f} MAE={mae0:.6f}")
-            ax.set_xlabel("action dim")
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-            p = out_dir / f"plot_idx{plot_index:05d}_single_step_vs_gt0.png"
-            fig.savefig(p, dpi=200)
-            plt.close(fig)
-            _log_info(f"[OK] Saved single-step plot: {colored(str(p), 'green')}")
-            return
-
+    a_inf = a_inf[0] if a_inf.ndim == 3 else a_inf
+    # align K with gt_K if needed
+    if a_inf.shape[0] != a_gt_np.shape[0]:
+        K = min(a_inf.shape[0], a_gt_np.shape[0])
+        a_inf = a_inf[:K]
+        a_gt_np_inf = a_gt_np[:K]
+        pad_np2 = pad_np[:K] if pad_np is not None else None
     else:
-        raise ValueError(f"Unsupported pred shape: {a_pred_np.shape}")
+        a_gt_np_inf = a_gt_np
+        pad_np2 = pad_np
 
-    _log_info(f"[INFO] Mode: {mode} -> pred {a_pred_np.shape}, gt {a_gt_np.shape}")
+    a_inf, a_gt_np_inf, K_valid2 = _drop_pad(a_inf, a_gt_np_inf, pad_np2)
+    _log_info(f"[INFO] After padding mask: K_valid={K_valid2}")
 
-    # --------- absolute + relative diagnosis ----------
-    abs_diag = diagnose_chunk_absolute(a_pred_np, eps_abs=eps_abs)
-    rel_diag = diagnose_chunk_relative_to_gt(a_pred_np, a_gt_np, repeat_ratio_thresh=repeat_ratio_thresh)
+    diag = diagnose_chunk(a_inf, a_gt_np_inf, eps_abs=eps_abs, repeat_ratio_thresh=repeat_ratio_thresh)
+    abs_diag, rel_diag = diag["abs_diag"], diag["rel_diag"]
 
-    _log_info(f"[DIAG-ABS] {json.dumps(abs_diag, indent=2)}")
-    _log_info(f"[DIAG-REL] {json.dumps(rel_diag, indent=2)}")
+    _log_info("[DIAG-ABS] " + json.dumps(abs_diag, indent=2))
+    _log_info("[DIAG-REL] " + json.dumps(rel_diag, indent=2))
 
-    # hard proof prints
-    _log_info(f"[PROOF] pred[0][:5]={a_pred_np[0, :5]}")
-    if a_pred_np.shape[0] > 1:
-        _log_info(f"[PROOF] pred[1][:5]={a_pred_np[1, :5]}")
-    if a_pred_np.shape[0] > 2:
-        _log_info(f"[PROOF] pred[2][:5]={a_pred_np[2, :5]}")
-    _log_info(f"[PROOF] variation_ratio(pred/gt)={rel_diag['variation_ratio_pred_over_gt']:.6e}")
-    _log_info(f"[PROOF] std_ratio_max={rel_diag['std_ratio_max']:.6e}, std_ratio_mean={rel_diag['std_ratio_mean']:.6e}")
+    _log_info(f"[PROOF] pred[0][:5]={a_inf[0][:5]}")
+    if a_inf.shape[0] > 1:
+        _log_info(f"[PROOF] pred[1][:5]={a_inf[1][:5]}")
+    if a_inf.shape[0] > 2:
+        _log_info(f"[PROOF] pred[2][:5]={a_inf[2][:5]}")
 
-    if abs_diag["looks_repeat_abs"] or (rel_diag["variation_ratio_pred_over_gt"] < repeat_ratio_thresh):
-        _log_warn(
-            "Pred changes over time are tiny compared to GT -> effectively repeating the same action across the 50-step chunk."
-        )
+    # “一行判据”（也写在日志里）
+    var_ratio = rel_diag["variation_ratio_pred_over_gt"]
+    _log_info(f"[ONE-LINE] var_ratio(pred/gt)={var_ratio:.3e}  (<<1e-3 means effectively repeating)")
+
+    if rel_diag["looks_like_repeat_relative_to_gt"]:
+        _log_warn("Pred changes over time are tiny compared to GT -> effectively repeating the same action across the chunk.")
     else:
         _log_info("Pred shows meaningful time variation relative to GT (not a flat chunk).")
 
-    # --------- save plots ----------
-    # 1) per-dim action traces
-    action_plot_path = out_dir / f"plot_idx{plot_index:05d}_actions.png"
-    plot_actions_1d(
-        a_pred_np, a_gt_np,
-        save_path=str(action_plot_path),
-        title=f"Actions Pred vs GT | split={split} | idx={plot_index} | mode={mode}"
+    # plots
+    plot_actions(
+        a_inf, a_gt_np_inf,
+        save_path=str(out_dir / f"plot_idx{plot_index:05d}_actions_inference.png"),
+        title=f"Inference (no GT actions) | split={split} | idx={plot_index}"
     )
-    _log_info(f"[OK] Saved action plot: {colored(str(action_plot_path), 'green')}")
-
-    # 2) pred-vs-gt chunk variation (the “is it flat?” smoking gun)
-    var_path = out_dir / f"plot_idx{plot_index:05d}_chunk_variation_pred_vs_gt.png"
-    plot_pred_gt_variation(
-        a_pred_np, a_gt_np,
-        save_path=str(var_path),
-        title=(
-            f"Chunk variation Pred vs GT | idx={plot_index} | "
-            f"var_ratio={rel_diag['variation_ratio_pred_over_gt']:.2e} | "
-            f"repeat_rel={rel_diag['looks_like_repeat_relative_to_gt']}"
-        )
+    plot_variation(
+        a_inf, a_gt_np_inf,
+        save_path=str(out_dir / f"plot_idx{plot_index:05d}_chunk_variation_pred_vs_gt_inference.png"),
+        title="Std over chunk (pred vs gt) | inference"
     )
-    _log_info(f"[OK] Saved variation plot: {colored(str(var_path), 'green')}")
 
-    # --------- save json diagnosis ----------
-    out = {
-        "mode": mode,
+    mse_inf = float(np.mean((a_inf - a_gt_np_inf) ** 2))
+    mae_inf = float(np.mean(np.abs(a_inf - a_gt_np_inf)))
+
+    summary = {
+        "mode": "inference_eval",
         "gt_K": int(gt_K),
-        "raw_pred_shape": list(a_pred.shape),
+        "used_K_after_align_and_pad": int(K_valid2),
+        "raw_pred_shape": list(map(int, list(a_inf.shape if isinstance(a_inf, np.ndarray) else []))),
         "abs_diag": abs_diag,
         "rel_diag": rel_diag,
-        "ckpt_summary": ckpt_summary,
+        "posterior_mse": mse_post,
+        "posterior_mae": mae_post,
+        "inference_mse": mse_inf,
+        "inference_mae": mae_inf,
+        "ckpt_summary": {
+            "missing_keys_count": ckpt_summary["missing_keys_count"],
+            "unexpected_keys_count": ckpt_summary["unexpected_keys_count"],
+        },
         "params": {
-            "chunk_eps_abs": float(eps_abs),
-            "repeat_ratio_thresh": float(repeat_ratio_thresh),
+            "chunk_eps_abs": eps_abs,
+            "repeat_ratio_thresh": repeat_ratio_thresh,
         },
     }
-    with open(out_dir / f"plot_idx{plot_index:05d}_chunk_diagnosis.json", "w") as f:
-        json.dump(out, f, indent=2)
-    _log_info(f"[OK] Saved diagnosis json: {colored(str(out_dir / f'plot_idx{plot_index:05d}_chunk_diagnosis.json'), 'green')}")
+    out_json = out_dir / f"plot_idx{plot_index:05d}_chunk_diagnosis_inference.json"
+    with open(out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    _log_info(f"[OK] Saved diagnosis json: {colored(str(out_json), 'green')}")
+    _log_info(f"[INFERENCE] mse={mse_inf:.6e} mae={mae_inf:.6e}")
 
 
 if __name__ == "__main__":
