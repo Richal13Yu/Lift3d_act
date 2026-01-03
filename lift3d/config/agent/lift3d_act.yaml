@@ -1,0 +1,30 @@
+name: Lift3D_ActActor
+instantiate_config:
+  _target_: lift3d.models.act_actor.Lift3DActActor
+
+  # Encoders
+  point_cloud_encoder:
+    _target_: lift3d.models.lift3d.model_loader.lift3d_clip_base
+  image_encoder: null
+
+  # Dims are injected by train_policy.py:
+  #   robot_state_dim=...
+  #   action_dim=...
+
+  # ACT (chunk) params
+  chunk_size: 50          # TODO: set this to your desired K
+
+  # Transformer params
+  d_model: 512
+  nhead: 8
+  num_decoder_layers: 4
+  dim_feedforward: 2048
+  dropout: 0.1
+
+  # Fusion
+  fuse_method: sum        # "sum" or "concat"
+
+  # Rollout (env evaluation)
+  rollout_mode: replan    # "replan" (recommended) or "open_loop"
+  temporal_ensemble_coeff: 0.01
+  max_history: null

@@ -1,0 +1,11 @@
+# lift3d/config/benchmark/offline.yaml
+name: Offline
+
+dataset_instantiate_config:
+  _target_: lift3d.dataset.MetaWorldDataset   # 只负责读 zarr，键名一致即可（images/point_clouds/robot_states/actions/texts）
+
+# 关键：不要 evaluator（否则会去找环境）
+evaluator_instantiate_config: null
+
+loss_func:
+  _target_: torch.nn.functional.mse_loss

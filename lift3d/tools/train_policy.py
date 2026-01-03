@@ -2,11 +2,9 @@ import functools
 import json
 import os
 import pathlib
-import sys
 
 import hydra
 import torch
-import wandb
 from hydra.utils import call, instantiate
 from omegaconf import OmegaConf
 from termcolor import colored
@@ -71,10 +69,14 @@ def main(config):
         data_dir=config.dataset_dir,
         split="validation",
     )
-    evaluator: Evaluator = instantiate(
-        config=config.benchmark.evaluator_instantiate_config,
-        task_name=config.task_name,
-    )
+
+    # <<< changed: evaluator is OPTIONAL for offline benchmark
+    evaluator: Evaluator | None = None
+    if config.benchmark.evaluator_instantiate_config is not None:
+        evaluator = instantiate(
+            config=config.benchmark.evaluator_instantiate_config,
+            task_name=config.task_name,
+        )
 
     ###############
     # dataloaders #
@@ -85,6 +87,7 @@ def main(config):
         num_workers=config.dataloader.num_workers,
         shuffle=config.dataloader.shuffle,
         pin_memory=config.dataloader.pin_memory,
+        drop_last=config.dataloader.drop_last,
     )
     train_loader = DataLoaderConstuctor(train_dataset)
     valid_loader = DataLoaderConstuctor(valid_dataset)
@@ -130,11 +133,18 @@ def main(config):
     ############
     # Training #
     ############
-    max_success, max_rewards, best_success = 0.0, 0.0, -1.0
-    loss_train = AverageMeter()
+    # <<< changed: best metric depends on whether evaluator exists
+    best_success = -1.0
+    best_val_loss = float("inf")
+
+    max_success, max_rewards = 0.0, 0.0
+
     for cur_epoch in range(config.train.num_epochs):
         epoch_logging_info = {"epoch_step": cur_epoch + 1}
+
+        # --- train ---
         model.train()
+        loss_train = AverageMeter()
         for cur_iter, (
             images,
             point_clouds,
@@ -145,15 +155,14 @@ def main(config):
         ) in enumerate(train_loader):
             iteration_info = {}
 
-            # training iteration
             images = images.to(config.device)
             point_clouds = point_clouds.to(config.device)
             robot_states = robot_states.to(config.device)
             actions = actions.to(config.device, non_blocking=True)
+
             preds = model(images, point_clouds, robot_states, texts)
             loss_result = call(config.benchmark.loss_func, preds, actions)
 
-            # loss verbose
             if isinstance(loss_result, tuple):
                 loss = loss_result[0]
                 loss_dict = loss_result[1]
@@ -161,22 +170,18 @@ def main(config):
                     iteration_info[f"train_interation/{key}"] = value
             else:
                 loss = loss_result
-
-            # step
+                
             optimizer.zero_grad()
             loss.backward()
 
-            # clip gradient
             if config.train.clip_grad_value > 0.0:
                 torch.nn.utils.clip_grad_value_(
                     model.parameters(), config.train.clip_grad_value
                 )
 
-            # update model
             optimizer.step()
             loss_train.update(loss.item())
 
-            # training iteration log
             iteration_info.update(
                 {
                     "iteration_step": cur_epoch * len(train_loader) + cur_iter + 1,
@@ -187,39 +192,38 @@ def main(config):
             )
             wandb_logger.log(iteration_info)
 
-        # update lr
         scheduler.step()
 
-        # training epoch log
         epoch_logging_info.update({"train_epoch/epoch_loss": loss_train.avg})
         Logger.log_info(f"[train] epoch={cur_epoch}, loss={loss_train.avg}")
 
-        # Validation
+        # --- validation ---
         periodic_validation = (cur_epoch + 1 > config.evaluation.num_skip_epochs) and (
             (cur_epoch + 1) % config.evaluation.validation_frequency_epochs == 0
         )
         last_epoch = (cur_epoch + 1) == config.train.num_epochs
+
         if periodic_validation or last_epoch:
             model.eval()
 
-            # validation loss
             loss_val = AverageMeter()
-            for cur_iter, (
+            for (
                 images,
                 point_clouds,
                 robot_states,
                 raw_states,
                 actions,
                 texts,
-            ) in enumerate(valid_loader):
+            ) in valid_loader:
                 images = images.to(config.device)
                 point_clouds = point_clouds.to(config.device)
                 robot_states = robot_states.to(config.device)
                 actions = actions.to(config.device, non_blocking=True)
+
                 with torch.no_grad():
                     preds = model(images, point_clouds, robot_states, texts)
-                loss_result = call(config.benchmark.loss_func, preds, actions)
 
+                loss_result = call(config.benchmark.loss_func, preds, actions)
                 if isinstance(loss_result, tuple):
                     loss_val.update(loss_result[0].item(), actions.shape[0])
                     loss_dict = loss_result[1]
@@ -228,61 +232,113 @@ def main(config):
                 else:
                     loss_val.update(loss_result.item(), actions.shape[0])
 
-            # validation success and rewards
-            avg_success, avg_rewards = evaluator.evaluate(
-                config.evaluation.validation_trajs_num, model
-            )
-            max_success, max_rewards = max(max_success, avg_success), max(
-                max_rewards, avg_rewards
-            )
             epoch_logging_info.update(
                 {
                     "validation/epoch": cur_epoch,
                     "validation/loss": loss_val.avg,
-                    "validation/success": avg_success,
-                    "validation/rewards": avg_rewards,
-                    "validation/max_success": max_success,
-                    "validation/max_rewards": max_rewards,
-                    "validation/video_steps": wandb.Video(
-                        evaluator.env.get_frames().transpose(0, 3, 1, 2), fps=30
-                    ),
                 }
             )
-            evaluator.callback(epoch_logging_info)
-            Logger.log_info(
-                f"[validation] epoch={cur_epoch}, "
-                f"validation_loss={loss_val.avg}, "
-                f"avg_success={avg_success}, "
-                f"avg_rewards={avg_rewards}, "
-                f"max_success={max_success}, "
-                f"max_rewards={max_rewards}"
-            )
 
-            # save best model
-            if config.evaluation.save_best_model and avg_success > best_success:
-                best_success = avg_success
-                model_path = os.path.join(
-                    hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"],
-                    "best_model.pth",
+            # <<< changed: only do rollout-eval if evaluator exists
+            if evaluator is not None:
+                avg_success, avg_rewards = evaluator.evaluate(
+                    config.evaluation.validation_trajs_num, model
                 )
-                torch.save(model.state_dict(), model_path)
-                Logger.log_info(f'Save best model to {colored(model_path, "red")}')
-                with open(
-                    os.path.join(
-                        hydra.core.hydra_config.HydraConfig.get()["runtime"][
-                            "output_dir"
-                        ],
-                        "best_model.json",
-                    ),
-                    "w",
-                ) as f:
-                    model_info = {
-                        "epoch": cur_epoch,
-                        "loss": loss_val.avg,
-                        "avg_success": avg_success,
-                        "avg_rewards": avg_rewards,
+                max_success, max_rewards = max(max_success, avg_success), max(
+                    max_rewards, avg_rewards
+                )
+                epoch_logging_info.update(
+                    {
+                        "validation/success": avg_success,
+                        "validation/rewards": avg_rewards,
+                        "validation/max_success": max_success,
+                        "validation/max_rewards": max_rewards,
                     }
-                    json.dump(model_info, f, indent=4)
+                )
+
+                # video only if env exists
+                if getattr(evaluator, "env", None) is not None and hasattr(
+                    evaluator.env, "get_frames"
+                ):
+                    epoch_logging_info["validation/video_steps"] = wandb.Video(
+                        evaluator.env.get_frames().transpose(0, 3, 1, 2), fps=30
+                    )
+
+                evaluator.callback(epoch_logging_info)
+
+                Logger.log_info(
+                    f"[validation] epoch={cur_epoch}, "
+                    f"validation_loss={loss_val.avg}, "
+                    f"avg_success={avg_success}, "
+                    f"avg_rewards={avg_rewards}, "
+                    f"max_success={max_success}, "
+                    f"max_rewards={max_rewards}"
+                )
+
+                # save best model by success
+                if config.evaluation.save_best_model and avg_success > best_success:
+                    best_success = avg_success
+                    model_path = os.path.join(
+                        hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"],
+                        "best_model.pth",
+                    )
+                    torch.save(model.state_dict(), model_path)
+                    Logger.log_info(f'Save best model to {colored(model_path, "red")}')
+                    with open(
+                        os.path.join(
+                            hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"],
+                            "best_model.json",
+                        ),
+                        "w",
+                    ) as f:
+                        model_info = {
+                            "epoch": cur_epoch,
+                            "val_loss": loss_val.avg,
+                            "avg_success": avg_success,
+                            "avg_rewards": avg_rewards,
+                        }
+                        json.dump(model_info, f, indent=4)
+
+            else:
+                # <<< offline: no rollout eval, use val loss as selection metric
+                Logger.log_info(
+                    f"[validation/offline] epoch={cur_epoch}, validation_loss={loss_val.avg}"
+                )
+
+                # log placeholder so wandb charts don't break
+                epoch_logging_info.update(
+                    {
+                        "validation/success": 0.0,
+                        "validation/rewards": 0.0,
+                        "validation/max_success": 0.0,
+                        "validation/max_rewards": 0.0,
+                    }
+                )
+
+                # save best model by LOWEST val loss
+                if config.evaluation.save_best_model and loss_val.avg < best_val_loss:
+                    best_val_loss = loss_val.avg
+                    model_path = os.path.join(
+                        hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"],
+                        "best_model.pth",
+                    )
+                    torch.save(model.state_dict(), model_path)
+                    Logger.log_info(
+                        f'Save best model (by val loss) to {colored(model_path, "red")}'
+                    )
+                    with open(
+                        os.path.join(
+                            hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"],
+                            "best_model.json",
+                        ),
+                        "w",
+                    ) as f:
+                        model_info = {
+                            "epoch": cur_epoch,
+                            "val_loss": loss_val.avg,
+                            "criterion": "min_val_loss",
+                        }
+                        json.dump(model_info, f, indent=4)
 
         # log epoch info
         wandb_logger.log(epoch_logging_info)

@@ -1,0 +1,43 @@
+defaults:
+  - _self_
+  - agent: lift3d_bnmlp
+  - benchmark: act_offline
+
+seed: 0
+device: cuda:0
+
+task_name: peg_recover
+camera_name: rgb
+image_size: 224
+
+project_root: /projects/surgical-video-digital-twin/datasets/act_peg_recover
+dataset_dir: /projects/surgical-video-digital-twin/datasets/act_peg_recover/1216/zarr
+
+dataloader:
+  batch_size: 16
+  num_workers: 0
+  shuffle: True
+  drop_last: True
+  pin_memory: True
+
+train:
+  clip_grad_value: 0.0
+  learning_rate: 0.001
+  num_epochs: 5000
+  scheduler_instantiate_config:
+    _target_: lift3d.helpers.pytorch.Optimizers.get_constant_scheduler
+    lr: ${train.learning_rate}
+
+evaluation:
+  num_skip_epochs: 0
+  validation_frequency_epochs: 5
+  validation_trajs_num: 0
+  save_best_model: True
+
+wandb:
+  project: Lift3D
+  group: null
+  name: ${agent.name}_${task_name}_${camera_name}
+  notes: ${task_name}
+  reinit: True
+  mode: online
