@@ -1,17 +1,9 @@
 # lift3d/config/benchmark/act_offline.yaml
 name: ACT_Offline
 
-# Train/val datasets are instantiated INSIDE the training script by passing:
-#   data_dir=... and split="train"/"validation"
-# So here we only define the dataset class + wrapper params.
 dataset_instantiate_config:
   _target_: lift3d.dataset.chunk_wrapper.ChunkDatasetWrapper
   _recursive_: false
-
-  # IMPORTANT:
-  # - Do NOT put split: train here. The script will pass split=... at instantiate time.
-  # - Do NOT put data_dir here. The script will pass data_dir=... at instantiate time.
-  # - ChunkDatasetWrapper accepts (data_dir, split) and forwards them to base_dataset.
 
   base_dataset:
     _target_: lift3d.dataset.MetaWorldDataset
@@ -22,27 +14,25 @@ dataset_instantiate_config:
   pad: true
   pad_value: 0.0
 
-  # Your fixed episode length (e.g. peg_recover has 700 frames)
+  # one episode has 700 frames in your peg_recover dataset
   episode_length: 700
 
-# Optional: dataset-based evaluator (no simulator)
+# Optional: dataset-based evaluator (offline)
 evaluator_instantiate_config:
   _target_: lift3d.envs.dataset_evaluator.DatasetEvaluator
-  _recursive_: false
+  _recursive_: false   # <<< IMPORTANT: prevent hydra from instantiating dataset_instantiate_config early
 
-  # DatasetEvaluator should be instantiated by the train script with:
-  #   task_name=...
-  # It should also be given dataset info; if your DatasetEvaluator signature needs these,
-  # keep them here. Otherwise remove them.
+  task_name: ${task_name}
+  data_dir: ${dataset_dir}
+  dataset_instantiate_config: ${benchmark.dataset_instantiate_config}
+
   split: validation
   episode_length: 700
   max_episode_length: null
 
-  # If your evaluator computes success from error signal
   success_from_error: true
   success_alpha: 5.0
 
-# ACT chunk supervision loss: expects preds/actions = [B, K, A] and is_pad=[B, K]
 loss_func:
   _target_: lift3d.loss.act_vae_loss.act_vae_loss
   kl_weight: 0.01

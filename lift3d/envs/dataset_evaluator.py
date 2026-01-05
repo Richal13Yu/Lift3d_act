@@ -19,7 +19,6 @@ class EpisodeStep:
 
 
 def _safe_to_int(v: Any) -> Optional[int]:
-    """Convert scalar-like to int. Return None if not safely convertible."""
     if v is None:
         return None
     if callable(v):
@@ -28,13 +27,10 @@ def _safe_to_int(v: Any) -> Optional[int]:
         if v.numel() != 1:
             return None
         return int(v.item())
-    # numpy scalar
     if isinstance(v, (np.generic,)):
         return int(v.item())
-    # python numeric
     if isinstance(v, (int, float, np.integer, np.floating)):
         return int(v)
-    # strings that are digits
     if isinstance(v, str):
         try:
             return int(v)
@@ -47,26 +43,23 @@ def _default_infer_episode_step(dataset: Dataset, index: int) -> EpisodeStep:
     """
     Best-effort inference from dataset[index][3] (raw_states).
 
-    IMPORTANT FIX:
-      - DO NOT use attribute 't' (torch.Tensor has .t() method).
+    IMPORTANT:
+      - DO NOT use key 't' (torch.Tensor has .t() method).
       - Skip callable attributes.
     """
     item = dataset[index]
     raw_states = item[3]
 
     ep_keys = ("episode_index", "episode_id", "episode")
-    st_keys = ("step_index", "frame_index", "step")  # <<< removed "t"
+    st_keys = ("step_index", "frame_index", "step")  # removed "t"
 
     def get_key(obj: Any, keys: Tuple[str, ...]) -> Optional[int]:
-        # dict-like
         if isinstance(obj, dict):
             for k in keys:
                 if k in obj:
-                    vv = obj[k]
-                    out = _safe_to_int(vv)
+                    out = _safe_to_int(obj[k])
                     if out is not None:
                         return out
-        # attribute-like
         for k in keys:
             if hasattr(obj, k):
                 vv = getattr(obj, k)
@@ -86,15 +79,40 @@ def _default_infer_episode_step(dataset: Dataset, index: int) -> EpisodeStep:
     return EpisodeStep(ep, st)
 
 
+# --- minimal addition: robustly extract action tensor from policy output ---
+def _get_actions_tensor(preds: Any) -> torch.Tensor:
+    """
+    Supports:
+      - Tensor
+      - dict with 'actions' / 'a_hat'
+      - dataclass/object with attribute '.actions' (e.g., your ActOutput)
+    """
+    if torch.is_tensor(preds):
+        return preds
+
+    if isinstance(preds, dict):
+        if "actions" in preds and torch.is_tensor(preds["actions"]):
+            return preds["actions"]
+        if "a_hat" in preds and torch.is_tensor(preds["a_hat"]):
+            return preds["a_hat"]
+
+    if hasattr(preds, "actions"):
+        a = getattr(preds, "actions")
+        if torch.is_tensor(a):
+            return a
+
+    raise TypeError(f"Cannot extract action tensor from model output: type={type(preds)}")
+
+
 class DatasetEvaluator(Evaluator):
     """
-    Offline evaluator: no gym env, just iterate the validation dataset.
+    Offline evaluator: no sim env. Iterate validation dataset.
 
-    Episode ordering:
-      - Prefer dataset.index_to_episode_step(i) / get_episode_step(i)
-      - Else try infer from raw_states
-      - Else fallback: sequential segmentation by episode_length (if provided)
-      - Else fallback: treat everything as one episode
+    Episode ordering priority:
+      1) dataset.index_to_episode_step(i) / dataset.get_episode_step(i)
+      2) infer from raw_states
+      3) sequential segmentation by episode_length
+      4) one big episode
     """
 
     def __init__(
@@ -104,9 +122,7 @@ class DatasetEvaluator(Evaluator):
         task_name: str,
         split: str = "validation",
         max_episode_length: Optional[int] = None,
-        # Fallback segmentation when episode/step cannot be inferred:
-        episode_length: Optional[int] = None,  # <<< NEW: set this for your dataset episodes
-        # how to turn error into a 0~1 "success" proxy
+        episode_length: Optional[int] = None,
         success_from_error: bool = True,
         success_alpha: float = 5.0,
     ):
@@ -128,32 +144,29 @@ class DatasetEvaluator(Evaluator):
         self.episode_to_indices: Dict[int, List[int]] = self._build_episode_index_map()
 
     def _index_to_episode_step(self, index: int) -> EpisodeStep:
-        # Prefer dataset-provided mapping
         if hasattr(self.dataset, "index_to_episode_step") and callable(getattr(self.dataset, "index_to_episode_step")):
             ep, st = self.dataset.index_to_episode_step(index)  # type: ignore
             return EpisodeStep(int(ep), int(st))
         if hasattr(self.dataset, "get_episode_step") and callable(getattr(self.dataset, "get_episode_step")):
             ep, st = self.dataset.get_episode_step(index)  # type: ignore
             return EpisodeStep(int(ep), int(st))
-
-        # Try infer from raw_states
         return _default_infer_episode_step(self.dataset, index)
 
     def _build_episode_index_map(self) -> Dict[int, List[int]]:
-        tmp: Dict[int, List[Tuple[int, int]]] = {}  # ep -> [(step, idx)]
+        tmp: Dict[int, List[Tuple[int, int]]] = {}
 
-        # Try to build from episode/step mapping
         try:
             for idx in range(len(self.dataset)):
                 epst = self._index_to_episode_step(idx)
                 tmp.setdefault(epst.episode_id, []).append((epst.step_id, idx))
+
             out: Dict[int, List[int]] = {}
             for ep, pairs in tmp.items():
                 pairs.sort(key=lambda x: x[0])
                 out[ep] = [i for _, i in pairs]
             return out
-        except Exception as e:
-            # Fallback: sequential segmentation
+
+        except Exception:
             n = len(self.dataset)
             if self.episode_length is not None and self.episode_length > 0:
                 out: Dict[int, List[int]] = {}
@@ -162,8 +175,22 @@ class DatasetEvaluator(Evaluator):
                     out.setdefault(ep, []).append(idx)
                 return out
 
-            # Final fallback: one big episode
             return {0: list(range(n))}
+
+    @staticmethod
+    def _unpack_item(item):
+        # support 6-tuple or 7-tuple
+        if not isinstance(item, (tuple, list)):
+            raise ValueError(f"Dataset item must be tuple/list, got {type(item)}")
+
+        if len(item) == 6:
+            images, point_clouds, robot_states, raw_states, actions, texts = item
+            is_pad = None
+        elif len(item) == 7:
+            images, point_clouds, robot_states, raw_states, actions, texts, is_pad = item
+        else:
+            raise ValueError(f"Unexpected item size {len(item)}; expected 6 or 7.")
+        return images, point_clouds, robot_states, raw_states, actions, texts, is_pad
 
     @torch.no_grad()
     def evaluate(self, num_episodes: int, policy, verbose: bool = False):
@@ -191,7 +218,8 @@ class DatasetEvaluator(Evaluator):
                 if self.max_episode_length is not None and steps_this_ep >= self.max_episode_length:
                     break
 
-                images, point_clouds, robot_states, raw_states, actions, texts = self.dataset[idx]
+                item = self.dataset[idx]
+                images, point_clouds, robot_states, raw_states, actions, texts, is_pad = self._unpack_item(item)
 
                 # batchify to [B=1,...]
                 if torch.is_tensor(images) and images.dim() == 3:
@@ -201,7 +229,6 @@ class DatasetEvaluator(Evaluator):
                 if torch.is_tensor(robot_states) and robot_states.dim() == 1:
                     robot_states = robot_states.unsqueeze(0)
 
-                # texts: list[str] length B
                 if isinstance(texts, str):
                     texts_b = [texts]
                 elif isinstance(texts, (list, tuple)):
@@ -231,8 +258,15 @@ class DatasetEvaluator(Evaluator):
                 else:
                     a_pred = policy(**input_data)
 
+                # --- minimal fix: support ActOutput/dict/Tensor ---
+                a_pred = _get_actions_tensor(a_pred)
+
+                # allow [B,K,A] or [B,A] or [A]
                 if a_pred.dim() == 3:
                     a_pred = a_pred[:, 0, :]
+                elif a_pred.dim() == 1:
+                    a_pred = a_pred.unsqueeze(0)
+
                 a_pred = a_pred.view(1, -1)
 
                 l1 = torch.mean(torch.abs(a_pred - a_gt)).item()
