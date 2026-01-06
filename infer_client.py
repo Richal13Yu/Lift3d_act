@@ -23,15 +23,14 @@ bridge = CvBridge()
 # ============================================================
 # HARD-CODE CONFIG (EDIT THESE)
 # ============================================================
-SERVER_URL = "http://<SERVER_IP>:8000"   # e.g. "http://192.168.1.10:8000"
+SERVER_URL = "http://10.162.34.26:8000"   # e.g. "http://192.168.1.10:8000"
 
 # ROS topics
 RGB_TOPIC     = "/rgb/image_rect_color"
 DEPTH_TOPIC   = "/depth_to_rgb/hw_registered/image_rect/"
-CAMINFO_TOPIC = "/rgb/camera_info"
 
 # preprocessing (must match training as close as possible)
-CROP       = [0, 480, 0, 640]     # y0 y1 x0 x1
+CROP       = [200, 880, 585, 1205]     # y0 y1 x0 x1
 RESIZE     = [224, 224]           # H W
 DEPTH_UNIT = "auto"               # auto|mm|m
 NUM_POINTS = 8192
@@ -43,9 +42,9 @@ SLEEP_DT   = 0.1
 EXEC_HORIZON = 50
 
 # action postprocess
-POS_SCALE   = 0.001               # if model outputs mm -> meters
+POS_SCALE   = 0.001               
 MOTION_MODE = "hybrid"            # "hybrid" or "tool_centric"
-REGISTRATION_JSON = ""            # optional, else ""
+REGISTRATION_JSON = "/home/hding15/Downloads/dt_agent/PSM1-registration-open-cv.json"            # optional, else ""
 DRY_RUN = False                   # True: no robot commands
 # ============================================================
 
@@ -157,7 +156,14 @@ def main():
         depth = bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
         depth = np.array(depth)  # keep original dtype (often uint16)
 
-        K = read_camera_info(CAMINFO_TOPIC, timeout=3.0)
+        K = np.array(
+            [
+                [903.95819092, 0.0, 956.72424316],
+                [0.0, 904.0100708, 548.60406494],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
         robot_state = get_current_robot_state(psm)
 
         # 2) Pack request
