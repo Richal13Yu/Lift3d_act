@@ -83,17 +83,31 @@ def _to_item(v):
 def _get_actions_pred(preds) -> torch.Tensor:
     """
     Extract action prediction tensor from model output.
+    Supports:
+      - Tensor
+      - dict with 'actions' or 'a_hat'
+      - ActOutput-like object with .actions / .a_hat
     """
     if torch.is_tensor(preds):
         return preds
+
     if isinstance(preds, dict):
-        if "actions" in preds:
+        if "actions" in preds and torch.is_tensor(preds["actions"]):
             return preds["actions"]
-        if "a_hat" in preds:
+        if "a_hat" in preds and torch.is_tensor(preds["a_hat"]):
             return preds["a_hat"]
+
+    # ActOutput / object style
+    for attr in ("actions", "a_hat", "pred_actions", "actions_hat"):
+        if hasattr(preds, attr):
+            v = getattr(preds, attr)
+            if torch.is_tensor(v):
+                return v
+
     raise ValueError(
-        "Model output must be a Tensor or a dict containing 'actions' or 'a_hat'. "
-        f"Got type={type(preds)} keys={list(preds.keys()) if isinstance(preds, dict) else None}"
+        "Model output must be a Tensor, a dict containing 'actions'/'a_hat', "
+        "or an object with attribute .actions/.a_hat. "
+        f"Got type={type(preds)}"
     )
 
 

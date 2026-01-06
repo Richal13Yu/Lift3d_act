@@ -1,39 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-lift3d/tools/eval_act.py
-
-Offline eval for ACT-style chunk policy.
-
-It evaluates TWO modes:
-1) POSTERIOR (train-like): model(..., actions=gt_actions, is_pad=gt_is_pad)
-2) INFERENCE (real):       model(..., actions=None)
-
-Supports model output types:
-- Tensor
-- dict with "actions"/"a_hat"
-- ActOutput object with .actions
-
-Metrics:
-- per-step MAE/MSE averaged over ALL valid (non-pad) steps in dataset split
-- optional plots + chunk flatness diagnostics on selected indices
-
-Run examples:
-  python -m lift3d.tools.eval_act \
-    task_name=peg_recover dataset_dir=... benchmark=act_offline agent=lift3d_act \
-    evaluation.checkpoint_path=/path/to/best_model.pth evaluation.split=validation \
-    evaluation.plot_indices='[0,10]' evaluation.max_batches=200
-
-Or from your bash:
-  HYDRA_FULL_ERROR=1 python lift3d/tools/eval_act.py evaluation.checkpoint_path=...
-"""
-
 from __future__ import annotations
 
 import os
 import json
 import pathlib
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 
 import hydra
@@ -71,30 +44,30 @@ def _print_sep():
     if hasattr(Logger, "print_seperator"):
         Logger.print_seperator()
     else:
-        print("-" * 100)
+        print("-" * 110)
 
 
 # ----------------------------
 # Batch helpers
 # ----------------------------
-def _unpack_batch(
-    batch,
+def _unpack_item(
+    item,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any, torch.Tensor, Any, Optional[torch.Tensor]]:
     """
-    Expected dataset batch formats:
+    Expected dataset item formats:
       - 6-tuple: images, point_clouds, robot_states, raw_states, actions, texts
       - 7-tuple: images, point_clouds, robot_states, raw_states, actions, texts, is_pad
     """
-    if not isinstance(batch, (tuple, list)):
-        raise ValueError(f"Batch must be tuple/list, got {type(batch)}")
+    if not isinstance(item, (tuple, list)):
+        raise ValueError(f"Dataset item must be tuple/list, got {type(item)}")
 
-    if len(batch) == 6:
-        images, point_clouds, robot_states, raw_states, actions, texts = batch
+    if len(item) == 6:
+        images, point_clouds, robot_states, raw_states, actions, texts = item
         is_pad = None
-    elif len(batch) == 7:
-        images, point_clouds, robot_states, raw_states, actions, texts, is_pad = batch
+    elif len(item) == 7:
+        images, point_clouds, robot_states, raw_states, actions, texts, is_pad = item
     else:
-        raise ValueError(f"Unexpected batch size {len(batch)}; expected 6 or 7.")
+        raise ValueError(f"Unexpected item size {len(item)}; expected 6 or 7.")
 
     return images, point_clouds, robot_states, raw_states, actions, texts, is_pad
 
@@ -125,14 +98,37 @@ def _ensure_chunk(x: torch.Tensor) -> torch.Tensor:
     Accepts:
       [B,A] -> [B,1,A]
       [B,K,A] -> unchanged
+      [K,A] -> [1,K,A]
+      [A] -> [1,1,A]
     """
+    if x.dim() == 1:
+        return x[None, None, :]
     if x.dim() == 2:
-        return x[:, None, :]
+        # ambiguous: could be [B,A] or [K,A]; in our usage for GT actions, usually [K,A]
+        return x[None, :, :]
     if x.dim() == 3:
         return x
-    raise ValueError(f"Expected action tensor [B,A] or [B,K,A], got {tuple(x.shape)}")
+    raise ValueError(f"Expected action tensor, got {tuple(x.shape)}")
 
 
+def _as_text_list(texts: Any, B: int) -> List[str]:
+    if isinstance(texts, str):
+        return [texts] * B
+    if isinstance(texts, (list, tuple)):
+        # DataLoader(batch_size>1) often gives list of strings already
+        t = [str(x) for x in texts]
+        if len(t) == B:
+            return t
+        if len(t) == 1:
+            return t * B
+        # fallback
+        return [t[0]] * B
+    return [str(texts)] * B
+
+
+# ----------------------------
+# Checkpoint helpers
+# ----------------------------
 def _strip_prefix_if_present(state_dict: Dict[str, torch.Tensor], prefixes=("module.", "model.")) -> Dict[str, torch.Tensor]:
     if not isinstance(state_dict, dict):
         return state_dict
@@ -187,102 +183,132 @@ def _load_checkpoint(model: torch.nn.Module, ckpt_file: str) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Diagnostics + plots
+# Episode indexing (关键：把 dataset index -> (episode, step))
 # ----------------------------
-def _valid_mask_from_is_pad(is_pad: Optional[torch.Tensor], K: int, device) -> torch.Tensor:
+@dataclass
+class EpisodeStep:
+    episode_id: int
+    step_id: int
+
+
+def _safe_to_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    if callable(v):
+        return None
+    if torch.is_tensor(v):
+        if v.numel() != 1:
+            return None
+        return int(v.item())
+    if isinstance(v, (np.generic,)):
+        return int(v.item())
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return int(v)
+    if isinstance(v, str):
+        try:
+            return int(v)
+        except Exception:
+            return None
+    return None
+
+
+def _default_infer_episode_step(dataset, index: int) -> EpisodeStep:
     """
-    Return boolean mask [B,K] where True=valid.
-    If is_pad is None -> all valid.
+    Best-effort inference from dataset[index][3] (raw_states).
+    Avoid key 't' (torch.Tensor has .t()).
     """
-    if is_pad is None:
-        return torch.ones((1, K), dtype=torch.bool, device=device)
-    is_pad = is_pad.to(device)
-    if is_pad.dim() == 2:
-        return (~is_pad.bool())
-    if is_pad.dim() == 1:
-        return (~is_pad.bool())[None, :]
-    raise ValueError(f"is_pad must be [B,K] or [K], got {tuple(is_pad.shape)}")
+    item = dataset[index]
+    raw_states = item[3]
+
+    ep_keys = ("episode_index", "episode_id", "episode")
+    st_keys = ("step_index", "frame_index", "step")
+
+    def get_key(obj: Any, keys: Tuple[str, ...]) -> Optional[int]:
+        if isinstance(obj, dict):
+            for k in keys:
+                if k in obj:
+                    out = _safe_to_int(obj[k])
+                    if out is not None:
+                        return out
+        for k in keys:
+            if hasattr(obj, k):
+                vv = getattr(obj, k)
+                out = _safe_to_int(vv)
+                if out is not None:
+                    return out
+        return None
+
+    ep = get_key(raw_states, ep_keys)
+    st = get_key(raw_states, st_keys)
+    if ep is None or st is None:
+        raise RuntimeError(
+            "Cannot infer (episode_id, step_id) from raw_states. "
+            "Please add dataset.index_to_episode_step(i)->(episode_id,step_id), "
+            "or provide evaluation.episode_length for fallback segmentation."
+        )
+    return EpisodeStep(ep, st)
 
 
-def diagnose_chunk_np(pred: np.ndarray, gt: np.ndarray, eps_abs: float = 1e-6, repeat_ratio_thresh: float = 1e-3) -> Dict[str, Any]:
+def _index_to_episode_step(dataset, index: int, episode_length_fallback: Optional[int]) -> EpisodeStep:
+    if hasattr(dataset, "index_to_episode_step") and callable(getattr(dataset, "index_to_episode_step")):
+        ep, st = dataset.index_to_episode_step(index)
+        return EpisodeStep(int(ep), int(st))
+    if hasattr(dataset, "get_episode_step") and callable(getattr(dataset, "get_episode_step")):
+        ep, st = dataset.get_episode_step(index)
+        return EpisodeStep(int(ep), int(st))
+
+    try:
+        return _default_infer_episode_step(dataset, index)
+    except Exception:
+        if episode_length_fallback is not None and episode_length_fallback > 0:
+            ep = index // int(episode_length_fallback)
+            st = index % int(episode_length_fallback)
+            return EpisodeStep(int(ep), int(st))
+        # 最后兜底：全当一个 episode
+        return EpisodeStep(0, int(index))
+
+
+def _build_episode_index_map(dataset, episode_length_fallback: Optional[int]) -> Dict[int, List[int]]:
+    tmp: Dict[int, List[Tuple[int, int]]] = {}
+    for idx in range(len(dataset)):
+        epst = _index_to_episode_step(dataset, idx, episode_length_fallback)
+        tmp.setdefault(epst.episode_id, []).append((epst.step_id, idx))
+
+    out: Dict[int, List[int]] = {}
+    for ep, pairs in tmp.items():
+        pairs.sort(key=lambda x: x[0])
+        out[ep] = [i for _, i in pairs]
+    return out
+
+
+# ----------------------------
+# Plot: 700-step continuous actions
+# ----------------------------
+def plot_trajectory_1episode(pred: np.ndarray, gt: np.ndarray, save_path: str, title: str):
     """
-    pred/gt: [K,A]
+    pred/gt: [T, A]
     """
-    K, A = pred.shape
+    T, A = pred.shape
+    t = np.arange(T)
 
-    step_change = np.abs(np.diff(pred, axis=0))  # [K-1,A]
-    max_step_change_abs = float(step_change.max()) if K > 1 else 0.0
-    pred_std = np.std(pred, axis=0)
-    gt_std = np.std(gt, axis=0)
-    max_std_over_time_dim = float(pred_std.max())
-    looks_repeat_abs = (max_step_change_abs < eps_abs) or (max_std_over_time_dim < eps_abs)
-
-    pred_l2_from0 = np.linalg.norm(pred - pred[0:1], axis=1)
-    gt_l2_from0 = np.linalg.norm(gt - gt[0:1], axis=1)
-    pred_l2_from0_max = float(pred_l2_from0.max())
-    gt_l2_from0_max = float(gt_l2_from0.max())
-    variation_ratio = float(pred_l2_from0_max / (gt_l2_from0_max + 1e-12))
-    looks_repeat_rel = variation_ratio < repeat_ratio_thresh
-
-    std_ratio = pred_std / (gt_std + 1e-12)
-
-    return {
-        "abs_diag": {
-            "K": int(K),
-            "A": int(A),
-            "max_step_change_abs": max_step_change_abs,
-            "max_std_over_time_dim": max_std_over_time_dim,
-            "looks_repeat_abs": bool(looks_repeat_abs),
-            "eps_abs": float(eps_abs),
-        },
-        "rel_diag": {
-            "pred_l2_from0_max": pred_l2_from0_max,
-            "gt_l2_from0_max": gt_l2_from0_max,
-            "variation_ratio_pred_over_gt": variation_ratio,
-            "pred_std_max": float(pred_std.max()),
-            "gt_std_max": float(gt_std.max()),
-            "std_ratio_max": float(std_ratio.max()),
-            "std_ratio_mean": float(std_ratio.mean()),
-            "repeat_ratio_thresh": float(repeat_ratio_thresh),
-            "looks_like_repeat_relative_to_gt": bool(looks_repeat_rel),
-        },
-    }
-
-
-def plot_actions(pred: np.ndarray, gt: np.ndarray, save_path: str, title: str):
-    K, A = pred.shape
-    t = np.arange(K)
     fig, axes = plt.subplots(A, 1, figsize=(14, 2.2 * A), sharex=True)
     if A == 1:
         axes = [axes]
     fig.suptitle(title)
+
     for i in range(A):
         ax = axes[i]
-        ax.plot(t, pred[:, i], label="pred", alpha=0.9)
-        ax.plot(t, gt[:, i], label="gt", alpha=0.9)
+        ax.plot(t, pred[:, i], label="Predicted")
+        ax.plot(t, gt[:, i], label="Ground Truth")
+        mse = float(np.mean((pred[:, i] - gt[:, i]) ** 2))
+        mae = float(np.mean(np.abs(pred[:, i] - gt[:, i])))
+        ax.set_title(f"MSE: {mse:.6f}, MAE: {mae:.6f}")
         ax.grid(True, alpha=0.3)
-        ax.set_ylabel(f"dim {i}")
-        ax.legend()
-    axes[-1].set_xlabel("k")
+        ax.set_ylabel(f"Action {i}")
+        ax.legend(loc="upper right")
+
+    axes[-1].set_xlabel("Timestep")
     plt.tight_layout()
-    fig.savefig(save_path, dpi=200)
-    plt.close(fig)
-
-
-def plot_variation(pred: np.ndarray, gt: np.ndarray, save_path: str, title: str):
-    pred_std = np.std(pred, axis=0)
-    gt_std = np.std(gt, axis=0)
-    x = np.arange(pred.shape[1])
-
-    fig = plt.figure(figsize=(14, 4))
-    ax = fig.add_subplot(111)
-    ax.plot(x, pred_std, marker="o", label="pred_std_over_k")
-    ax.plot(x, gt_std, marker="o", label="gt_std_over_k")
-    ax.set_title(title)
-    ax.set_xlabel("action_dim")
-    ax.set_ylabel("std over chunk (k)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
 
@@ -290,9 +316,9 @@ def plot_variation(pred: np.ndarray, gt: np.ndarray, save_path: str, title: str)
 # ----------------------------
 # Main
 # ----------------------------
-@hydra.main(version_base=None, config_path="../config", config_name="train")
+@hydra.main(version_base=None, config_path="lift3d/config", config_name="train")
 def main(config):
-    _log_info(f"[INFO] Eval ACT with {colored(pathlib.Path(__file__).absolute(), 'red')}")
+    _log_info(f"[INFO] Eval ACT (episode-stitch) with {colored(pathlib.Path(__file__).absolute(), 'red')}")
     _log_info(f"[INFO] Task: {colored(config.task_name, 'green')}")
     _log_info(f"[INFO] Dataset dir: {colored(config.dataset_dir, 'green')}")
     _log_info(f"[INFO] Device: {colored(config.device, 'green')}")
@@ -304,28 +330,21 @@ def main(config):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     eval_cfg = getattr(config, "evaluation", None)
-
     split = getattr(eval_cfg, "split", "validation") if eval_cfg is not None else "validation"
+
     ckpt_path = getattr(eval_cfg, "checkpoint_path", None) if eval_cfg is not None else None
     if ckpt_path is None and eval_cfg is not None:
         ckpt_path = getattr(eval_cfg, "ckpt_path", None)
     if ckpt_path is None:
         raise ValueError("Please provide checkpoint path via +evaluation.checkpoint_path=...")
 
-    # optional controls
-    max_batches = getattr(eval_cfg, "max_batches", None) if eval_cfg is not None else None
-    plot_indices = getattr(eval_cfg, "plot_indices", []) if eval_cfg is not None else []
-    if isinstance(plot_indices, int):
-        plot_indices = [plot_indices]
-    if plot_indices is None:
-        plot_indices = []
-    plot_indices = list(plot_indices)
+    # episode stitch controls
+    episode_id = getattr(eval_cfg, "episode_id", None) if eval_cfg is not None else None  # int or None
+    episode_length = getattr(eval_cfg, "episode_length", None) if eval_cfg is not None else None  # fallback only
+    max_steps = getattr(eval_cfg, "max_steps", None) if eval_cfg is not None else None  # optional truncate
+    eval_batch_size = int(getattr(eval_cfg, "eval_batch_size", 16)) if eval_cfg is not None else 16
 
-    eps_abs = float(getattr(eval_cfg, "chunk_eps_abs", 1e-6)) if eval_cfg is not None else 1e-6
-    repeat_ratio_thresh = float(getattr(eval_cfg, "repeat_ratio_thresh", 1e-3)) if eval_cfg is not None else 1e-3
-
-    # IMPORTANT: make inference deterministic as much as possible
-    # (your actor currently samples z ~ N(0,1) in inference; this makes eval reproducible)
+    # make inference deterministic (if your actor samples z)
     torch.manual_seed(0)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(0)
@@ -333,8 +352,9 @@ def main(config):
     ckpt_file = _resolve_checkpoint_path(ckpt_path)
     _log_info(f"[INFO] Using checkpoint: {colored(ckpt_file, 'green')}")
     _log_info(f"[INFO] Split: {colored(split, 'green')}")
+    _log_info(f"[INFO] eval_batch_size: {eval_batch_size}")
 
-    # dataset / loader
+    # dataset (direct iteration, no DataLoader collation issues for raw_states)
     dataset = instantiate(
         config=config.benchmark.dataset_instantiate_config,
         data_dir=config.dataset_dir,
@@ -343,20 +363,19 @@ def main(config):
     if len(dataset) == 0:
         raise RuntimeError(f"Dataset split '{split}' is empty.")
 
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=1,
-        num_workers=getattr(config.dataloader, "num_workers", 0),
-        shuffle=False,
-        pin_memory=getattr(config.dataloader, "pin_memory", False),
-        drop_last=False,
-    )
+    # infer dims from first item
+    it0 = dataset[0]
+    images0, pc0, rs0, raw0, act0, txt0, pad0 = _unpack_item(it0)
 
-    # infer dims from first batch
-    first_batch = next(iter(loader))
-    images, point_clouds, robot_states, raw_states, actions, texts, is_pad = _unpack_batch(first_batch)
-    robot_state_dim = int(robot_states.size(-1))
-    action_dim = int(actions.size(-1))
+    # action_dim from GT (chunk or single)
+    act0_t = act0 if torch.is_tensor(act0) else torch.as_tensor(act0, dtype=torch.float32)
+    if act0_t.dim() == 2:
+        action_dim = int(act0_t.shape[-1])
+    else:
+        action_dim = int(act0_t.view(-1).shape[0])
+
+    robot_states0 = rs0 if torch.is_tensor(rs0) else torch.as_tensor(rs0, dtype=torch.float32)
+    robot_state_dim = int(robot_states0.view(-1).shape[0])
 
     _log_info(f"[INFO] Robot state dim: {robot_state_dim}")
     _log_info(f"[INFO] Action dim: {action_dim}")
@@ -372,148 +391,171 @@ def main(config):
     _log_info(f"[INFO] ckpt load summary: missing={ckpt_summary['missing_keys_count']}, unexpected={ckpt_summary['unexpected_keys_count']}")
     model.eval()
 
-    # accumulate metrics over dataset
-    sum_mae_post = 0.0
-    sum_mse_post = 0.0
-    sum_mae_inf = 0.0
-    sum_mse_inf = 0.0
-    n_valid_steps = 0
+    # build episode map
+    ep_map = _build_episode_index_map(dataset, episode_length_fallback=episode_length)
+    ep_ids = sorted(list(ep_map.keys()))
+    if len(ep_ids) == 0:
+        raise RuntimeError("No episodes found in dataset (episode map empty).")
 
-    # optional diag snapshots
-    diag_records: List[Dict[str, Any]] = []
+    if episode_id is None:
+        chosen_ep = ep_ids[0]
+    else:
+        chosen_ep = int(episode_id)
+        if chosen_ep not in ep_map:
+            raise ValueError(f"episode_id={chosen_ep} not found. available={ep_ids[:20]}... (total {len(ep_ids)})")
 
-    for bi, batch in enumerate(loader):
-        if max_batches is not None and bi >= int(max_batches):
-            break
+    idxs = ep_map[chosen_ep]
+    if max_steps is not None:
+        idxs = idxs[: int(max_steps)]
 
-        images, point_clouds, robot_states, raw_states, actions, texts, is_pad = _unpack_batch(batch)
+    _log_info(f"[INFO] Chosen episode_id={chosen_ep}, num_steps={len(idxs)}")
 
-        images = images.to(config.device)
-        point_clouds = point_clouds.to(config.device)
-        robot_states = robot_states.to(config.device)
-        actions = actions.to(config.device)
-        if is_pad is not None:
-            is_pad = is_pad.to(config.device)
+    # We will build continuous arrays: pred_inf[t], gt[t]
+    pred_list: List[np.ndarray] = []
+    gt_list: List[np.ndarray] = []
+    step_id_list: List[int] = []
 
-        # GT chunk: [1,K,A]
-        a_gt = _ensure_chunk(actions)
-        K = a_gt.shape[1]
-        valid_mask = _valid_mask_from_is_pad(is_pad, K, device=a_gt.device)  # [1,K]
+    # batched inference buffers
+    buf_imgs: List[torch.Tensor] = []
+    buf_pcs: List[torch.Tensor] = []
+    buf_rs: List[torch.Tensor] = []
+    buf_txt: List[Any] = []
+    buf_gt_chunk: List[torch.Tensor] = []
+    buf_pad: List[Optional[torch.Tensor]] = []
+    buf_stepid: List[int] = []
 
-        # ----------------------------
-        # POSTERIOR: pass GT actions
-        # ----------------------------
+    def flush_batch():
+        nonlocal buf_imgs, buf_pcs, buf_rs, buf_txt, buf_gt_chunk, buf_pad, buf_stepid
+        if len(buf_imgs) == 0:
+            return
+
+        B = len(buf_imgs)
+        device = config.device
+
+        imgs = torch.stack(buf_imgs, dim=0).to(device)                # [B,C,H,W] or [B,...]
+        pcs = torch.stack(buf_pcs, dim=0).to(device)                  # [B,N,3] (assume fixed N)
+        rs = torch.stack(buf_rs, dim=0).to(device)                    # [B,D]
+        texts = _as_text_list(buf_txt, B)
+
+        # inference
         with torch.no_grad():
-            preds_post = model(images, point_clouds, robot_states, texts, actions=a_gt, is_pad=is_pad)
-        a_post = _ensure_chunk(_get_actions_pred(preds_post))  # [1,K,A]
+            preds_inf = model(imgs, pcs, rs, texts)
+        a_inf = _ensure_chunk(_get_actions_pred(preds_inf))           # [B,K,A]
+        a0_inf = a_inf[:, 0, :].detach().cpu().numpy()                # [B,A]
 
-        # ----------------------------
-        # INFERENCE: no GT actions
-        # ----------------------------
-        with torch.no_grad():
-            preds_inf = model(images, point_clouds, robot_states, texts)
-        a_inf = _ensure_chunk(_get_actions_pred(preds_inf))  # [1,K',A]
-        # align K if needed
-        if a_inf.shape[1] != K:
-            K2 = min(a_inf.shape[1], K)
-            a_inf = a_inf[:, :K2, :]
-            a_post = a_post[:, :K2, :]
-            a_gt = a_gt[:, :K2, :]
-            valid_mask = valid_mask[:, :K2]
-            K = K2
+        # GT: take first step of GT chunk
+        for bi in range(B):
+            gt_chunk = buf_gt_chunk[bi]                               # [K,A] or [A]
+            gt_chunk = _ensure_chunk(gt_chunk)[0]                     # [K,A]
+            gt0 = gt_chunk[0].detach().cpu().numpy()                  # [A]
 
-        # compute per-step errors on valid steps only
-        # flatten [1,K,A] -> [K,A]
-        vm = valid_mask[0]  # [K]
-        if vm.sum().item() == 0:
-            continue
+            pred_list.append(a0_inf[bi])
+            gt_list.append(gt0)
+            step_id_list.append(int(buf_stepid[bi]))
 
-        post_valid = a_post[0, vm, :]
-        inf_valid = a_inf[0, vm, :]
-        gt_valid = a_gt[0, vm, :]
+        # reset
+        buf_imgs, buf_pcs, buf_rs, buf_txt, buf_gt_chunk, buf_pad, buf_stepid = [], [], [], [], [], [], []
 
-        mae_post = torch.mean(torch.abs(post_valid - gt_valid)).item()
-        mse_post = torch.mean((post_valid - gt_valid) ** 2).item()
-        mae_inf = torch.mean(torch.abs(inf_valid - gt_valid)).item()
-        mse_inf = torch.mean((inf_valid - gt_valid) ** 2).item()
+    # iterate steps in episode
+    for ds_idx in idxs:
+        epst = _index_to_episode_step(dataset, ds_idx, episode_length_fallback=episode_length)
+        item = dataset[ds_idx]
+        images, point_clouds, robot_states, raw_states, actions, texts, is_pad = _unpack_item(item)
 
-        # weight by number of valid steps (so pad 不会影响平均)
-        w = int(vm.sum().item())
-        sum_mae_post += mae_post * w
-        sum_mse_post += mse_post * w
-        sum_mae_inf += mae_inf * w
-        sum_mse_inf += mse_inf * w
-        n_valid_steps += w
+        # tensors
+        img_t = images if torch.is_tensor(images) else torch.as_tensor(images, dtype=torch.float32)
+        pc_t = point_clouds if torch.is_tensor(point_clouds) else torch.as_tensor(point_clouds, dtype=torch.float32)
+        rs_t = robot_states if torch.is_tensor(robot_states) else torch.as_tensor(robot_states, dtype=torch.float32)
+        act_t = actions if torch.is_tensor(actions) else torch.as_tensor(actions, dtype=torch.float32)
 
-        # optional plot/diag for selected indices (dataset index == batch index because shuffle=False)
-        if bi in plot_indices:
-            p_post = post_valid.detach().cpu().numpy()
-            p_inf = inf_valid.detach().cpu().numpy()
-            g_np = gt_valid.detach().cpu().numpy()
+        # ensure shapes: img [C,H,W], pc [N,3], rs [D]
+        if img_t.dim() == 4 and img_t.shape[0] == 1:
+            img_t = img_t[0]
+        if rs_t.dim() == 2 and rs_t.shape[0] == 1:
+            rs_t = rs_t[0]
+        if pc_t.dim() == 3 and pc_t.shape[0] == 1:
+            pc_t = pc_t[0]
 
-            # diag on inference chunk
-            diag = diagnose_chunk_np(p_inf, g_np, eps_abs=eps_abs, repeat_ratio_thresh=repeat_ratio_thresh)
-            diag_records.append({"index": bi, "K_valid": w, **diag})
+        buf_imgs.append(img_t)
+        buf_pcs.append(pc_t)
+        buf_rs.append(rs_t)
+        buf_txt.append(texts)
+        buf_gt_chunk.append(act_t)
+        buf_pad.append(is_pad)
+        buf_stepid.append(epst.step_id)
 
-            plot_actions(
-                p_inf, g_np,
-                save_path=str(out_dir / f"idx{bi:05d}_actions_inference.png"),
-                title=f"Inference (no GT actions) | split={split} | idx={bi}"
-            )
-            plot_variation(
-                p_inf, g_np,
-                save_path=str(out_dir / f"idx{bi:05d}_variation_inference.png"),
-                title=f"Std over chunk (pred vs gt) | inference | idx={bi}"
-            )
-            plot_actions(
-                p_post, g_np,
-                save_path=str(out_dir / f"idx{bi:05d}_actions_posterior.png"),
-                title=f"Posterior (with GT actions) | split={split} | idx={bi}"
-            )
+        if len(buf_imgs) >= eval_batch_size:
+            flush_batch()
 
-            rel = diag["rel_diag"]
-            _log_info(f"[DIAG idx={bi}] var_ratio(pred/gt)={rel['variation_ratio_pred_over_gt']:.3e} "
-                      f"repeat={rel['looks_like_repeat_relative_to_gt']}")
+    flush_batch()
 
-    if n_valid_steps == 0:
-        _log_warn("No valid steps found (all padded or empty loader).")
-        return
+    # sort by step_id (in case dataset order isn't perfect)
+    order = np.argsort(np.array(step_id_list, dtype=np.int64))
+    pred = np.stack([pred_list[i] for i in order], axis=0)  # [T,A]
+    gt = np.stack([gt_list[i] for i in order], axis=0)      # [T,A]
+    steps = np.array([step_id_list[i] for i in order], dtype=np.int64)
 
-    # global averages
-    avg_mae_post = sum_mae_post / n_valid_steps
-    avg_mse_post = sum_mse_post / n_valid_steps
-    avg_mae_inf = sum_mae_inf / n_valid_steps
-    avg_mse_inf = sum_mse_inf / n_valid_steps
+    # if steps are not 0..T-1, we still plot by index; also save step ids
+    T = pred.shape[0]
+    _log_info(f"[INFO] Built stitched trajectory: T={T}, A={pred.shape[1]}")
+    _log_info(f"[INFO] step_id range: {steps.min()} .. {steps.max()}")
 
-    _print_sep()
-    _log_info(f"[POSTERIOR] avg_mae={avg_mae_post:.6e} avg_mse={avg_mse_post:.6e} (over {n_valid_steps} valid steps)")
-    _log_info(f"[INFERENCE ] avg_mae={avg_mae_inf:.6e} avg_mse={avg_mse_inf:.6e} (over {n_valid_steps} valid steps)")
+    # global metrics on the episode
+    mse_all = float(np.mean((pred - gt) ** 2))
+    mae_all = float(np.mean(np.abs(pred - gt)))
+    _log_info(f"[EPISODE] MSE={mse_all:.6f}  MAE={mae_all:.6f}")
 
+    # plot
+    fig_path = out_dir / f"episode_{chosen_ep}_actions_pred_vs_gt.png"
+    plot_trajectory_1episode(
+        pred, gt,
+        save_path=str(fig_path),
+        title=f"Predicted vs Ground Truth Actions | task={config.task_name} | split={split} | episode={chosen_ep} | T={T}"
+    )
+    _log_info(f"[OK] Saved plot: {colored(str(fig_path), 'green')}")
+
+    # save npz
+    npz_path = out_dir / f"episode_{chosen_ep}_actions_pred_vs_gt.npz"
+    np.savez_compressed(
+        str(npz_path),
+        pred=pred,
+        gt=gt,
+        step_id=steps,
+        episode_id=int(chosen_ep),
+        split=split,
+        checkpoint=str(ckpt_file),
+    )
+    _log_info(f"[OK] Saved npz: {colored(str(npz_path), 'green')}")
+
+    # summary json
     summary = {
+        "task": config.task_name,
         "split": split,
-        "checkpoint": ckpt_file,
-        "n_valid_steps": int(n_valid_steps),
-        "posterior": {"avg_mae": float(avg_mae_post), "avg_mse": float(avg_mse_post)},
-        "inference": {"avg_mae": float(avg_mae_inf), "avg_mse": float(avg_mse_inf)},
+        "checkpoint": str(ckpt_file),
+        "episode_id": int(chosen_ep),
+        "T": int(T),
+        "A": int(pred.shape[1]),
+        "mse": mse_all,
+        "mae": mae_all,
+        "step_id_min": int(steps.min()) if len(steps) else None,
+        "step_id_max": int(steps.max()) if len(steps) else None,
         "ckpt_summary": {
             "missing_keys_count": ckpt_summary["missing_keys_count"],
             "unexpected_keys_count": ckpt_summary["unexpected_keys_count"],
         },
-        "diag_records": diag_records,
         "params": {
-            "chunk_eps_abs": float(eps_abs),
-            "repeat_ratio_thresh": float(repeat_ratio_thresh),
-            "plot_indices": plot_indices,
-            "max_batches": None if max_batches is None else int(max_batches),
+            "eval_batch_size": int(eval_batch_size),
+            "episode_length_fallback": None if episode_length is None else int(episode_length),
+            "max_steps": None if max_steps is None else int(max_steps),
         },
     }
-
-    out_json = out_dir / "eval_act_summary.json"
+    out_json = out_dir / "eval_episode_stitch_summary.json"
     with open(out_json, "w") as f:
         json.dump(summary, f, indent=2)
-
     _log_info(f"[OK] Saved summary json: {colored(str(out_json), 'green')}")
-    _log_info(f"[OK] Output dir: {colored(str(out_dir), 'green')}")
+
+    _print_sep()
+    _log_info(f"[DONE] Output dir: {colored(str(out_dir), 'green')}")
 
 
 if __name__ == "__main__":
