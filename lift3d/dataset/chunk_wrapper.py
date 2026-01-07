@@ -39,6 +39,11 @@ class ChunkDatasetWrapper(Dataset):
     Key feature:
       - Supports fixed episode length (episode_length) so you DON'T need episode_id/step_id inside raw_states.
       - Compatible with Hydra passing (data_dir=..., split=...) into dataset_instantiate_config.
+
+    Extra feature (added here):
+      - Optional scaling for position xyz in BOTH robot_states and actions (e.g., meters -> millimeters).
+        Set pos_scale=1000.0 to multiply xyz by 1000 during training data loading.
+        Default pos_scale=1.0 keeps original behavior.
     """
 
     def __init__(
@@ -65,6 +70,9 @@ class ChunkDatasetWrapper(Dataset):
         raw_state_step_keys: Tuple[str, ...] = ("step_index", "frame_index", "t", "step"),
         episode_to_indices: Optional[Dict[int, List[int]]] = None,
         force_torch: bool = True,
+        # ---- added: position scaling ----
+        pos_scale: float = 1.0,
+        pos_dim: int = 3,
     ):
         super().__init__()
         assert chunk_size >= 1, "chunk_size must be >= 1"
@@ -75,6 +83,12 @@ class ChunkDatasetWrapper(Dataset):
         self.pad = bool(pad)
         self.pad_value = float(pad_value)
         self.force_torch = bool(force_torch)
+
+        # ---- added: position scaling ----
+        self.pos_scale = float(pos_scale)
+        self.pos_dim = int(pos_dim)
+        if self.pos_dim < 0:
+            raise ValueError("pos_dim must be >= 0")
 
         self.episode_length = int(episode_length) if episode_length is not None else None
         self._raw_state_episode_keys = raw_state_episode_keys
@@ -240,7 +254,20 @@ class ChunkDatasetWrapper(Dataset):
         # Keep first 6 fields, ignore any extras
         images, point_clouds, robot_states, raw_states, action_t, texts = item0[:6]
 
+        # Ensure torch tensors for scaling logic
+        robot_states = self._to_torch(robot_states).view(-1)
         action_t = self._to_torch(action_t).view(-1)
+
+        # Optional scaling (e.g., meters -> millimeters)
+        if self.pos_scale != 1.0 and self.pos_dim > 0:
+            rs = robot_states.clone()
+            rs[: self.pos_dim] *= self.pos_scale
+            robot_states = rs
+
+            at = action_t.clone()
+            at[: self.pos_dim] *= self.pos_scale
+            action_t = at
+
         action_dim = int(action_t.numel())
 
         # Identify episode and position
@@ -268,6 +295,7 @@ class ChunkDatasetWrapper(Dataset):
                 item_k = self.base[gidx_k]
                 if not isinstance(item_k, (tuple, list)) or len(item_k) < 6:
                     raise RuntimeError("Base dataset item format changed unexpectedly.")
+
                 action_k = self._to_torch(item_k[4]).view(-1)
 
                 if action_k.numel() != action_dim:
@@ -275,6 +303,11 @@ class ChunkDatasetWrapper(Dataset):
                         f"Action dim mismatch inside episode. "
                         f"Expected {action_dim}, got {int(action_k.numel())} at global index {gidx_k}."
                     )
+
+                if self.pos_scale != 1.0 and self.pos_dim > 0:
+                    ak = action_k.clone()
+                    ak[: self.pos_dim] *= self.pos_scale
+                    action_k = ak
 
                 actions_list.append(action_k)
                 is_pad_list.append(False)
@@ -293,8 +326,6 @@ class ChunkDatasetWrapper(Dataset):
 
         # Always return fixed length K if pad=True
         if self.pad and len(actions_list) != self.K:
-            # This can happen if pad=False; but if pad=True we enforce K
-            # (should be unreachable)
             while len(actions_list) < self.K:
                 actions_list.append(
                     torch.full(
@@ -315,5 +346,5 @@ class ChunkDatasetWrapper(Dataset):
         if torch.is_tensor(x):
             return x
         if not self.force_torch:
-            raise TypeError("force_torch=False but got non-tensor action.")
+            raise TypeError("force_torch=False but got non-tensor input.")
         return torch.as_tensor(x, dtype=torch.float32)

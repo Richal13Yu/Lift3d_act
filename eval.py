@@ -126,6 +126,45 @@ def _as_text_list(texts: Any, B: int) -> List[str]:
     return [str(texts)] * B
 
 
+def _valid_prefix_len_from_is_pad(is_pad: Optional[Any], k: int) -> int:
+    """
+    Return a robust best-effort "valid prefix length" for a chunk, based on is_pad.
+    Handles ambiguity of pad semantics by trying both interpretations and taking the longer valid prefix.
+    """
+    if is_pad is None:
+        return k
+
+    try:
+        if torch.is_tensor(is_pad):
+            pad_np = is_pad.detach().cpu().numpy()
+        else:
+            pad_np = np.array(is_pad)
+        pad_np = pad_np.reshape(-1)[:k]
+        pad_bool = pad_np.astype(bool)
+
+        # interpretation 1: True means PAD
+        if pad_bool.any():
+            v1 = int(np.argmax(pad_bool))  # first True
+        else:
+            v1 = k
+
+        # interpretation 2: True means VALID (so pad is ~pad_bool)
+        pad2 = ~pad_bool
+        if pad2.any():
+            v2 = int(np.argmax(pad2))
+        else:
+            v2 = k
+
+        v = max(v1, v2)
+        v = int(np.clip(v, 0, k))
+        if v == 0 and k > 0:
+            # last fallback: if everything looks padded, keep full chunk
+            return k
+        return v
+    except Exception:
+        return k
+
+
 # ----------------------------
 # Checkpoint helpers
 # ----------------------------
@@ -282,7 +321,7 @@ def _build_episode_index_map(dataset, episode_length_fallback: Optional[int]) ->
 
 
 # ----------------------------
-# Plot: 700-step continuous actions
+# Plot: continuous actions over an episode
 # ----------------------------
 def plot_trajectory_1episode(pred: np.ndarray, gt: np.ndarray, save_path: str, title: str):
     """
@@ -318,7 +357,7 @@ def plot_trajectory_1episode(pred: np.ndarray, gt: np.ndarray, save_path: str, t
 # ----------------------------
 @hydra.main(version_base=None, config_path="lift3d/config", config_name="train")
 def main(config):
-    _log_info(f"[INFO] Eval ACT (episode-stitch) with {colored(pathlib.Path(__file__).absolute(), 'red')}")
+    _log_info(f"[INFO] Eval ACT (episode-stitch, FULL-CHUNK) with {colored(pathlib.Path(__file__).absolute(), 'red')}")
     _log_info(f"[INFO] Task: {colored(config.task_name, 'green')}")
     _log_info(f"[INFO] Dataset dir: {colored(config.dataset_dir, 'green')}")
     _log_info(f"[INFO] Device: {colored(config.device, 'green')}")
@@ -343,6 +382,10 @@ def main(config):
     episode_length = getattr(eval_cfg, "episode_length", None) if eval_cfg is not None else None  # fallback only
     max_steps = getattr(eval_cfg, "max_steps", None) if eval_cfg is not None else None  # optional truncate
     eval_batch_size = int(getattr(eval_cfg, "eval_batch_size", 16)) if eval_cfg is not None else 16
+
+    # (NEW) chunk_stride: how many dataset steps to advance between chunk predictions.
+    # Default: use GT chunk length K (non-overlap stitching).
+    chunk_stride_cfg = getattr(eval_cfg, "chunk_stride", None) if eval_cfg is not None else None
 
     # make inference deterministic (if your actor samples z)
     torch.manual_seed(0)
@@ -371,14 +414,22 @@ def main(config):
     act0_t = act0 if torch.is_tensor(act0) else torch.as_tensor(act0, dtype=torch.float32)
     if act0_t.dim() == 2:
         action_dim = int(act0_t.shape[-1])
+        gt_chunk_len0 = int(act0_t.shape[0])
     else:
         action_dim = int(act0_t.view(-1).shape[0])
+        gt_chunk_len0 = 1
 
     robot_states0 = rs0 if torch.is_tensor(rs0) else torch.as_tensor(rs0, dtype=torch.float32)
     robot_state_dim = int(robot_states0.view(-1).shape[0])
 
+    # decide chunk_stride
+    chunk_stride = int(chunk_stride_cfg) if chunk_stride_cfg is not None else int(gt_chunk_len0)
+    chunk_stride = max(1, chunk_stride)
+
     _log_info(f"[INFO] Robot state dim: {robot_state_dim}")
     _log_info(f"[INFO] Action dim: {action_dim}")
+    _log_info(f"[INFO] GT chunk len (from dataset[0]): {gt_chunk_len0}")
+    _log_info(f"[INFO] chunk_stride: {chunk_stride}  (advance steps between chunks)")
 
     # model
     model = instantiate(
@@ -404,13 +455,28 @@ def main(config):
         if chosen_ep not in ep_map:
             raise ValueError(f"episode_id={chosen_ep} not found. available={ep_ids[:20]}... (total {len(ep_ids)})")
 
-    idxs = ep_map[chosen_ep]
+    # all indices in this episode (already step-sorted by _build_episode_index_map)
+    idxs_all = ep_map[chosen_ep]
     if max_steps is not None:
-        idxs = idxs[: int(max_steps)]
+        idxs_all = idxs_all[: int(max_steps)]
 
-    _log_info(f"[INFO] Chosen episode_id={chosen_ep}, num_steps={len(idxs)}")
+    if len(idxs_all) == 0:
+        raise RuntimeError(f"Chosen episode {chosen_ep} has 0 steps after truncation.")
 
-    # We will build continuous arrays: pred_inf[t], gt[t]
+    # episode step bounds (for end truncation)
+    epst_first = _index_to_episode_step(dataset, idxs_all[0], episode_length_fallback=episode_length)
+    epst_last = _index_to_episode_step(dataset, idxs_all[-1], episode_length_fallback=episode_length)
+    step_min_ep = int(epst_first.step_id)
+    step_max_ep = int(epst_last.step_id)
+
+    # (CHANGED) only take chunk-start indices: 0, stride, 2*stride, ...
+    idxs = idxs_all[::chunk_stride]
+
+    _log_info(f"[INFO] Chosen episode_id={chosen_ep}")
+    _log_info(f"[INFO] episode steps (dataset items): {len(idxs_all)} | using chunk starts: {len(idxs)}")
+    _log_info(f"[INFO] step_id range: {step_min_ep} .. {step_max_ep}")
+
+    # We will build continuous arrays: pred[t], gt[t] by stitching FULL chunks
     pred_list: List[np.ndarray] = []
     gt_list: List[np.ndarray] = []
     step_id_list: List[int] = []
@@ -440,23 +506,44 @@ def main(config):
         # inference
         with torch.no_grad():
             preds_inf = model(imgs, pcs, rs, texts)
+
         a_inf = _ensure_chunk(_get_actions_pred(preds_inf))           # [B,K,A]
-        a0_inf = a_inf[:, 0, :].detach().cpu().numpy()                # [B,A]
+        a_inf_np = a_inf.detach().cpu().numpy()                       # [B,K,A]
 
-        # GT: take first step of GT chunk
+        # stitch FULL chunk for each sample
         for bi in range(B):
-            gt_chunk = buf_gt_chunk[bi]                               # [K,A] or [A]
-            gt_chunk = _ensure_chunk(gt_chunk)[0]                     # [K,A]
-            gt0 = gt_chunk[0].detach().cpu().numpy()                  # [A]
+            start_step = int(buf_stepid[bi])
 
-            pred_list.append(a0_inf[bi])
-            gt_list.append(gt0)
-            step_id_list.append(int(buf_stepid[bi]))
+            pred_chunk = a_inf_np[bi]                                 # [K_pred, A]
+
+            gt_chunk_t = buf_gt_chunk[bi]
+            gt_chunk = _ensure_chunk(gt_chunk_t)[0].detach().cpu().numpy()  # [K_gt, A]
+
+            k = int(min(pred_chunk.shape[0], gt_chunk.shape[0]))
+            if k <= 0:
+                continue
+
+            # truncate by is_pad (best-effort)
+            k_valid = _valid_prefix_len_from_is_pad(buf_pad[bi], k)
+
+            # truncate by episode end (avoid going beyond last step_id)
+            remaining = (step_max_ep - start_step + 1)
+            if remaining <= 0:
+                continue
+            k_valid = int(min(k_valid, remaining))
+            if k_valid <= 0:
+                continue
+
+            # append step-by-step into global lists
+            for j in range(k_valid):
+                pred_list.append(pred_chunk[j].copy())
+                gt_list.append(gt_chunk[j].copy())
+                step_id_list.append(start_step + j)
 
         # reset
         buf_imgs, buf_pcs, buf_rs, buf_txt, buf_gt_chunk, buf_pad, buf_stepid = [], [], [], [], [], [], []
 
-    # iterate steps in episode
+    # iterate chunk starts in episode
     for ds_idx in idxs:
         epst = _index_to_episode_step(dataset, ds_idx, episode_length_fallback=episode_length)
         item = dataset[ds_idx]
@@ -489,33 +576,35 @@ def main(config):
 
     flush_batch()
 
-    # sort by step_id (in case dataset order isn't perfect)
+    if len(step_id_list) == 0:
+        raise RuntimeError("No stitched actions produced. Check chunk_stride / is_pad / episode step ids.")
+
+    # sort by step_id (in case)
     order = np.argsort(np.array(step_id_list, dtype=np.int64))
     pred = np.stack([pred_list[i] for i in order], axis=0)  # [T,A]
     gt = np.stack([gt_list[i] for i in order], axis=0)      # [T,A]
     steps = np.array([step_id_list[i] for i in order], dtype=np.int64)
 
-    # if steps are not 0..T-1, we still plot by index; also save step ids
     T = pred.shape[0]
-    _log_info(f"[INFO] Built stitched trajectory: T={T}, A={pred.shape[1]}")
-    _log_info(f"[INFO] step_id range: {steps.min()} .. {steps.max()}")
+    _log_info(f"[INFO] Built stitched FULL-CHUNK trajectory: T={T}, A={pred.shape[1]}")
+    _log_info(f"[INFO] stitched step_id range: {int(steps.min())} .. {int(steps.max())}")
 
-    # global metrics on the episode
+    # global metrics on the stitched episode-trajectory
     mse_all = float(np.mean((pred - gt) ** 2))
     mae_all = float(np.mean(np.abs(pred - gt)))
     _log_info(f"[EPISODE] MSE={mse_all:.6f}  MAE={mae_all:.6f}")
 
     # plot
-    fig_path = out_dir / f"episode_{chosen_ep}_actions_pred_vs_gt.png"
+    fig_path = out_dir / f"episode_{chosen_ep}_actions_pred_vs_gt_FULLCHUNK.png"
     plot_trajectory_1episode(
         pred, gt,
         save_path=str(fig_path),
-        title=f"Predicted vs Ground Truth Actions | task={config.task_name} | split={split} | episode={chosen_ep} | T={T}"
+        title=f"Predicted vs GT Actions (FULL CHUNK STITCH) | task={config.task_name} | split={split} | episode={chosen_ep} | T={T} | stride={chunk_stride}"
     )
     _log_info(f"[OK] Saved plot: {colored(str(fig_path), 'green')}")
 
     # save npz
-    npz_path = out_dir / f"episode_{chosen_ep}_actions_pred_vs_gt.npz"
+    npz_path = out_dir / f"episode_{chosen_ep}_actions_pred_vs_gt_FULLCHUNK.npz"
     np.savez_compressed(
         str(npz_path),
         pred=pred,
@@ -524,6 +613,7 @@ def main(config):
         episode_id=int(chosen_ep),
         split=split,
         checkpoint=str(ckpt_file),
+        chunk_stride=int(chunk_stride),
     )
     _log_info(f"[OK] Saved npz: {colored(str(npz_path), 'green')}")
 
@@ -537,8 +627,10 @@ def main(config):
         "A": int(pred.shape[1]),
         "mse": mse_all,
         "mae": mae_all,
-        "step_id_min": int(steps.min()) if len(steps) else None,
-        "step_id_max": int(steps.max()) if len(steps) else None,
+        "stitched_step_id_min": int(steps.min()) if len(steps) else None,
+        "stitched_step_id_max": int(steps.max()) if len(steps) else None,
+        "episode_step_id_min": int(step_min_ep),
+        "episode_step_id_max": int(step_max_ep),
         "ckpt_summary": {
             "missing_keys_count": ckpt_summary["missing_keys_count"],
             "unexpected_keys_count": ckpt_summary["unexpected_keys_count"],
@@ -547,9 +639,10 @@ def main(config):
             "eval_batch_size": int(eval_batch_size),
             "episode_length_fallback": None if episode_length is None else int(episode_length),
             "max_steps": None if max_steps is None else int(max_steps),
+            "chunk_stride": int(chunk_stride),
         },
     }
-    out_json = out_dir / "eval_episode_stitch_summary.json"
+    out_json = out_dir / "eval_episode_stitch_summary_FULLCHUNK.json"
     with open(out_json, "w") as f:
         json.dump(summary, f, indent=2)
     _log_info(f"[OK] Saved summary json: {colored(str(out_json), 'green')}")
