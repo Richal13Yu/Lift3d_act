@@ -104,7 +104,6 @@ def _ensure_chunk(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 1:
         return x[None, None, :]
     if x.dim() == 2:
-        # ambiguous: could be [B,A] or [K,A]; in our usage for GT actions, usually [K,A]
         return x[None, :, :]
     if x.dim() == 3:
         return x
@@ -115,13 +114,11 @@ def _as_text_list(texts: Any, B: int) -> List[str]:
     if isinstance(texts, str):
         return [texts] * B
     if isinstance(texts, (list, tuple)):
-        # DataLoader(batch_size>1) often gives list of strings already
         t = [str(x) for x in texts]
         if len(t) == B:
             return t
         if len(t) == 1:
             return t * B
-        # fallback
         return [t[0]] * B
     return [str(texts)] * B
 
@@ -158,11 +155,28 @@ def _valid_prefix_len_from_is_pad(is_pad: Optional[Any], k: int) -> int:
         v = max(v1, v2)
         v = int(np.clip(v, 0, k))
         if v == 0 and k > 0:
-            # last fallback: if everything looks padded, keep full chunk
             return k
         return v
     except Exception:
         return k
+
+
+def _scale_first_dims(x: np.ndarray, scale: float, pos_dim: int) -> np.ndarray:
+    """Only scale first pos_dim dims (xyz)."""
+    if scale == 1.0 or pos_dim <= 0:
+        return x
+    y = x.copy()
+    y[..., :pos_dim] *= scale
+    return y
+
+
+def _scale_first_dims_torch(x: torch.Tensor, scale: float, pos_dim: int) -> torch.Tensor:
+    """Torch version: only scale first pos_dim dims (xyz)."""
+    if scale == 1.0 or pos_dim <= 0:
+        return x
+    y = x.clone()
+    y[..., :pos_dim] *= scale
+    return y
 
 
 # ----------------------------
@@ -222,7 +236,7 @@ def _load_checkpoint(model: torch.nn.Module, ckpt_file: str) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Episode indexing (关键：把 dataset index -> (episode, step))
+# Episode indexing
 # ----------------------------
 @dataclass
 class EpisodeStep:
@@ -303,7 +317,6 @@ def _index_to_episode_step(dataset, index: int, episode_length_fallback: Optiona
             ep = index // int(episode_length_fallback)
             st = index % int(episode_length_fallback)
             return EpisodeStep(int(ep), int(st))
-        # 最后兜底：全当一个 episode
         return EpisodeStep(0, int(index))
 
 
@@ -378,16 +391,23 @@ def main(config):
         raise ValueError("Please provide checkpoint path via +evaluation.checkpoint_path=...")
 
     # episode stitch controls
-    episode_id = getattr(eval_cfg, "episode_id", None) if eval_cfg is not None else None  # int or None
-    episode_length = getattr(eval_cfg, "episode_length", None) if eval_cfg is not None else None  # fallback only
-    max_steps = getattr(eval_cfg, "max_steps", None) if eval_cfg is not None else None  # optional truncate
+    episode_id = getattr(eval_cfg, "episode_id", None) if eval_cfg is not None else None
+    episode_length = getattr(eval_cfg, "episode_length", None) if eval_cfg is not None else None
+    max_steps = getattr(eval_cfg, "max_steps", None) if eval_cfg is not None else None
     eval_batch_size = int(getattr(eval_cfg, "eval_batch_size", 16)) if eval_cfg is not None else 16
 
-    # (NEW) chunk_stride: how many dataset steps to advance between chunk predictions.
-    # Default: use GT chunk length K (non-overlap stitching).
+    # chunk_stride: how many dataset steps to advance between chunk predictions.
     chunk_stride_cfg = getattr(eval_cfg, "chunk_stride", None) if eval_cfg is not None else None
 
-    # make inference deterministic (if your actor samples z)
+    # -------- NEW: scaling controls --------
+    # If dataset does NOT already do scaling, we will apply `train_pos_scale` to rs/actions before model forward.
+    # Typical: train_pos_scale=1000.0 (m->mm)
+    train_pos_scale = float(getattr(eval_cfg, "pos_scale", 1.0)) if eval_cfg is not None else 1.0
+    pos_dim = int(getattr(eval_cfg, "pos_dim", 3)) if eval_cfg is not None else 3
+    # If True: output/plot/npz will unscale xyz back to meters (divide by 1000 when train_pos_scale=1000)
+    unscale_to_meters = bool(getattr(eval_cfg, "unscale_to_meters", True)) if eval_cfg is not None else True
+
+    # deterministic
     torch.manual_seed(0)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(0)
@@ -397,7 +417,7 @@ def main(config):
     _log_info(f"[INFO] Split: {colored(split, 'green')}")
     _log_info(f"[INFO] eval_batch_size: {eval_batch_size}")
 
-    # dataset (direct iteration, no DataLoader collation issues for raw_states)
+    # dataset
     dataset = instantiate(
         config=config.benchmark.dataset_instantiate_config,
         data_dir=config.dataset_dir,
@@ -406,11 +426,34 @@ def main(config):
     if len(dataset) == 0:
         raise RuntimeError(f"Dataset split '{split}' is empty.")
 
+    # detect if dataset already scales xyz (e.g. ChunkDatasetWrapper(pos_scale=1000))
+    dataset_pos_scale = None
+    if hasattr(dataset, "pos_scale"):
+        try:
+            dataset_pos_scale = float(getattr(dataset, "pos_scale"))
+        except Exception:
+            dataset_pos_scale = None
+
+    if dataset_pos_scale is not None and dataset_pos_scale != 1.0:
+        # dataset already returns scaled rs/actions in model space
+        scale_for_model = 1.0
+        model_space_scale = dataset_pos_scale
+        _log_info(f"[INFO] Detected dataset.pos_scale={dataset_pos_scale} -> assume rs/actions already scaled for model.")
+    else:
+        # dataset returns original units; eval will scale to match training
+        scale_for_model = train_pos_scale
+        model_space_scale = train_pos_scale
+        _log_info(f"[INFO] Dataset has no pos_scale; using evaluation.pos_scale={train_pos_scale} for model inputs/GT.")
+
+    # inverse: model space -> meters (for xyz only)
+    inv_scale_for_plot = (1.0 / model_space_scale) if (unscale_to_meters and model_space_scale != 0.0) else 1.0
+
+    _log_info(f"[INFO] pos_dim={pos_dim}, scale_for_model={scale_for_model}, model_space_scale={model_space_scale}, unscale_to_meters={unscale_to_meters}")
+
     # infer dims from first item
     it0 = dataset[0]
     images0, pc0, rs0, raw0, act0, txt0, pad0 = _unpack_item(it0)
 
-    # action_dim from GT (chunk or single)
     act0_t = act0 if torch.is_tensor(act0) else torch.as_tensor(act0, dtype=torch.float32)
     if act0_t.dim() == 2:
         action_dim = int(act0_t.shape[-1])
@@ -422,7 +465,6 @@ def main(config):
     robot_states0 = rs0 if torch.is_tensor(rs0) else torch.as_tensor(rs0, dtype=torch.float32)
     robot_state_dim = int(robot_states0.view(-1).shape[0])
 
-    # decide chunk_stride
     chunk_stride = int(chunk_stride_cfg) if chunk_stride_cfg is not None else int(gt_chunk_len0)
     chunk_stride = max(1, chunk_stride)
 
@@ -455,7 +497,6 @@ def main(config):
         if chosen_ep not in ep_map:
             raise ValueError(f"episode_id={chosen_ep} not found. available={ep_ids[:20]}... (total {len(ep_ids)})")
 
-    # all indices in this episode (already step-sorted by _build_episode_index_map)
     idxs_all = ep_map[chosen_ep]
     if max_steps is not None:
         idxs_all = idxs_all[: int(max_steps)]
@@ -463,22 +504,22 @@ def main(config):
     if len(idxs_all) == 0:
         raise RuntimeError(f"Chosen episode {chosen_ep} has 0 steps after truncation.")
 
-    # episode step bounds (for end truncation)
     epst_first = _index_to_episode_step(dataset, idxs_all[0], episode_length_fallback=episode_length)
     epst_last = _index_to_episode_step(dataset, idxs_all[-1], episode_length_fallback=episode_length)
     step_min_ep = int(epst_first.step_id)
     step_max_ep = int(epst_last.step_id)
 
-    # (CHANGED) only take chunk-start indices: 0, stride, 2*stride, ...
     idxs = idxs_all[::chunk_stride]
 
     _log_info(f"[INFO] Chosen episode_id={chosen_ep}")
     _log_info(f"[INFO] episode steps (dataset items): {len(idxs_all)} | using chunk starts: {len(idxs)}")
     _log_info(f"[INFO] step_id range: {step_min_ep} .. {step_max_ep}")
 
-    # We will build continuous arrays: pred[t], gt[t] by stitching FULL chunks
-    pred_list: List[np.ndarray] = []
-    gt_list: List[np.ndarray] = []
+    # We build continuous arrays by stitching FULL chunks
+    pred_list_raw: List[np.ndarray] = []
+    gt_list_raw: List[np.ndarray] = []
+    pred_list_plot: List[np.ndarray] = []
+    gt_list_plot: List[np.ndarray] = []
     step_id_list: List[int] = []
 
     # batched inference buffers
@@ -498,35 +539,38 @@ def main(config):
         B = len(buf_imgs)
         device = config.device
 
-        imgs = torch.stack(buf_imgs, dim=0).to(device)                # [B,C,H,W] or [B,...]
-        pcs = torch.stack(buf_pcs, dim=0).to(device)                  # [B,N,3] (assume fixed N)
-        rs = torch.stack(buf_rs, dim=0).to(device)                    # [B,D]
+        imgs = torch.stack(buf_imgs, dim=0).to(device)
+        pcs = torch.stack(buf_pcs, dim=0).to(device)
+        rs = torch.stack(buf_rs, dim=0).to(device)
         texts = _as_text_list(buf_txt, B)
 
-        # inference
+        # scale rs to match training, ONLY if dataset did not already do it
+        if scale_for_model != 1.0:
+            rs = _scale_first_dims_torch(rs, scale_for_model, pos_dim)
+
         with torch.no_grad():
             preds_inf = model(imgs, pcs, rs, texts)
 
-        a_inf = _ensure_chunk(_get_actions_pred(preds_inf))           # [B,K,A]
-        a_inf_np = a_inf.detach().cpu().numpy()                       # [B,K,A]
+        a_inf = _ensure_chunk(_get_actions_pred(preds_inf))      # [B,K,A]
+        a_inf_np = a_inf.detach().cpu().numpy()                  # model space (scaled)
 
-        # stitch FULL chunk for each sample
         for bi in range(B):
             start_step = int(buf_stepid[bi])
-
-            pred_chunk = a_inf_np[bi]                                 # [K_pred, A]
+            pred_chunk = a_inf_np[bi]                            # [K_pred,A] in model space
 
             gt_chunk_t = buf_gt_chunk[bi]
-            gt_chunk = _ensure_chunk(gt_chunk_t)[0].detach().cpu().numpy()  # [K_gt, A]
+            gt_chunk = _ensure_chunk(gt_chunk_t)[0].detach().cpu().numpy()  # [K_gt,A] dataset space
+
+            # scale GT to model space if needed (dataset didn't scale)
+            if scale_for_model != 1.0:
+                gt_chunk = _scale_first_dims(gt_chunk, scale_for_model, pos_dim)
 
             k = int(min(pred_chunk.shape[0], gt_chunk.shape[0]))
             if k <= 0:
                 continue
 
-            # truncate by is_pad (best-effort)
             k_valid = _valid_prefix_len_from_is_pad(buf_pad[bi], k)
 
-            # truncate by episode end (avoid going beyond last step_id)
             remaining = (step_max_ep - start_step + 1)
             if remaining <= 0:
                 continue
@@ -534,28 +578,36 @@ def main(config):
             if k_valid <= 0:
                 continue
 
-            # append step-by-step into global lists
             for j in range(k_valid):
-                pred_list.append(pred_chunk[j].copy())
-                gt_list.append(gt_chunk[j].copy())
+                p_raw = pred_chunk[j].copy()
+                g_raw = gt_chunk[j].copy()
+
+                pred_list_raw.append(p_raw)
+                gt_list_raw.append(g_raw)
+
+                if inv_scale_for_plot != 1.0:
+                    p_plot = _scale_first_dims(p_raw, inv_scale_for_plot, pos_dim)
+                    g_plot = _scale_first_dims(g_raw, inv_scale_for_plot, pos_dim)
+                else:
+                    p_plot = p_raw
+                    g_plot = g_raw
+
+                pred_list_plot.append(p_plot)
+                gt_list_plot.append(g_plot)
                 step_id_list.append(start_step + j)
 
-        # reset
         buf_imgs, buf_pcs, buf_rs, buf_txt, buf_gt_chunk, buf_pad, buf_stepid = [], [], [], [], [], [], []
 
-    # iterate chunk starts in episode
     for ds_idx in idxs:
         epst = _index_to_episode_step(dataset, ds_idx, episode_length_fallback=episode_length)
         item = dataset[ds_idx]
         images, point_clouds, robot_states, raw_states, actions, texts, is_pad = _unpack_item(item)
 
-        # tensors
         img_t = images if torch.is_tensor(images) else torch.as_tensor(images, dtype=torch.float32)
         pc_t = point_clouds if torch.is_tensor(point_clouds) else torch.as_tensor(point_clouds, dtype=torch.float32)
         rs_t = robot_states if torch.is_tensor(robot_states) else torch.as_tensor(robot_states, dtype=torch.float32)
         act_t = actions if torch.is_tensor(actions) else torch.as_tensor(actions, dtype=torch.float32)
 
-        # ensure shapes: img [C,H,W], pc [N,3], rs [D]
         if img_t.dim() == 4 and img_t.shape[0] == 1:
             img_t = img_t[0]
         if rs_t.dim() == 2 and rs_t.shape[0] == 1:
@@ -579,41 +631,60 @@ def main(config):
     if len(step_id_list) == 0:
         raise RuntimeError("No stitched actions produced. Check chunk_stride / is_pad / episode step ids.")
 
-    # sort by step_id (in case)
     order = np.argsort(np.array(step_id_list, dtype=np.int64))
-    pred = np.stack([pred_list[i] for i in order], axis=0)  # [T,A]
-    gt = np.stack([gt_list[i] for i in order], axis=0)      # [T,A]
+
+    pred_raw = np.stack([pred_list_raw[i] for i in order], axis=0)
+    gt_raw = np.stack([gt_list_raw[i] for i in order], axis=0)
+
+    pred = np.stack([pred_list_plot[i] for i in order], axis=0)
+    gt = np.stack([gt_list_plot[i] for i in order], axis=0)
+
     steps = np.array([step_id_list[i] for i in order], dtype=np.int64)
 
     T = pred.shape[0]
     _log_info(f"[INFO] Built stitched FULL-CHUNK trajectory: T={T}, A={pred.shape[1]}")
     _log_info(f"[INFO] stitched step_id range: {int(steps.min())} .. {int(steps.max())}")
 
-    # global metrics on the stitched episode-trajectory
-    mse_all = float(np.mean((pred - gt) ** 2))
-    mae_all = float(np.mean(np.abs(pred - gt)))
-    _log_info(f"[EPISODE] MSE={mse_all:.6f}  MAE={mae_all:.6f}")
+    # metrics (raw/model-space)
+    mse_raw = float(np.mean((pred_raw - gt_raw) ** 2))
+    mae_raw = float(np.mean(np.abs(pred_raw - gt_raw)))
+
+    # metrics (plot-space: if unscale_to_meters=True, xyz is meters)
+    mse_plot = float(np.mean((pred - gt) ** 2))
+    mae_plot = float(np.mean(np.abs(pred - gt)))
+
+    _log_info(f"[EPISODE][RAW/model-space] MSE={mse_raw:.6f}  MAE={mae_raw:.6f}")
+    if unscale_to_meters:
+        _log_info(f"[EPISODE][PLOT/meters for xyz] MSE={mse_plot:.6f}  MAE={mae_plot:.6f}")
+    else:
+        _log_info(f"[EPISODE][PLOT same as raw] MSE={mse_plot:.6f}  MAE={mae_plot:.6f}")
 
     # plot
     fig_path = out_dir / f"episode_{chosen_ep}_actions_pred_vs_gt_FULLCHUNK.png"
+    unit_note = "xyz in meters" if unscale_to_meters else "xyz in model-space"
     plot_trajectory_1episode(
         pred, gt,
         save_path=str(fig_path),
-        title=f"Predicted vs GT Actions (FULL CHUNK STITCH) | task={config.task_name} | split={split} | episode={chosen_ep} | T={T} | stride={chunk_stride}"
+        title=f"Pred vs GT (FULL CHUNK STITCH) | {unit_note} | task={config.task_name} | split={split} | episode={chosen_ep} | T={T} | stride={chunk_stride}"
     )
     _log_info(f"[OK] Saved plot: {colored(str(fig_path), 'green')}")
 
-    # save npz
+    # save npz (save both raw and plot arrays)
     npz_path = out_dir / f"episode_{chosen_ep}_actions_pred_vs_gt_FULLCHUNK.npz"
     np.savez_compressed(
         str(npz_path),
-        pred=pred,
-        gt=gt,
+        pred_plot=pred,
+        gt_plot=gt,
+        pred_raw=pred_raw,
+        gt_raw=gt_raw,
         step_id=steps,
         episode_id=int(chosen_ep),
         split=split,
         checkpoint=str(ckpt_file),
         chunk_stride=int(chunk_stride),
+        pos_dim=int(pos_dim),
+        model_space_scale=float(model_space_scale),
+        unscale_to_meters=bool(unscale_to_meters),
     )
     _log_info(f"[OK] Saved npz: {colored(str(npz_path), 'green')}")
 
@@ -625,8 +696,12 @@ def main(config):
         "episode_id": int(chosen_ep),
         "T": int(T),
         "A": int(pred.shape[1]),
-        "mse": mse_all,
-        "mae": mae_all,
+        "metrics": {
+            "mse_raw": mse_raw,
+            "mae_raw": mae_raw,
+            "mse_plot": mse_plot,
+            "mae_plot": mae_plot,
+        },
         "stitched_step_id_min": int(steps.min()) if len(steps) else None,
         "stitched_step_id_max": int(steps.max()) if len(steps) else None,
         "episode_step_id_min": int(step_min_ep),
@@ -634,6 +709,15 @@ def main(config):
         "ckpt_summary": {
             "missing_keys_count": ckpt_summary["missing_keys_count"],
             "unexpected_keys_count": ckpt_summary["unexpected_keys_count"],
+        },
+        "scaling": {
+            "pos_dim": int(pos_dim),
+            "dataset_pos_scale_detected": None if dataset_pos_scale is None else float(dataset_pos_scale),
+            "evaluation_pos_scale": float(train_pos_scale),
+            "scale_for_model_applied_in_eval": float(scale_for_model),
+            "model_space_scale": float(model_space_scale),
+            "unscale_to_meters": bool(unscale_to_meters),
+            "inv_scale_for_plot": float(inv_scale_for_plot),
         },
         "params": {
             "eval_batch_size": int(eval_batch_size),
