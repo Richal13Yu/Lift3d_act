@@ -2,6 +2,10 @@
 export WANDB_ROOT=/projects/surgical-video-digital-twin/new_results/act_peg_recover/lift3d/wandb_root
 mkdir -p "$WANDB_ROOT"/{runs,cache,config}
 
+export ACT_VAE_DEBUG=1
+export ACT_VAE_DEBUG_EVERY=5000
+
+# 然后正常启动训练
 # wandb 写盘位置（关键）
 export WANDB_DIR="$WANDB_ROOT/runs"
 export WANDB_CACHE_DIR="$WANDB_ROOT/cache"
@@ -15,6 +19,7 @@ python -m lift3d.tools.act_policy \
   benchmark=act_offline \
   agent=lift3d_act \
   task_name=peg_recover \
-  dataloader.batch_size=16 \
+  dataloader.batch_size=8 \
   dataset_dir=/projects/surgical-video-digital-twin/datasets/act_peg_recover/1216/zarr \
-  hydra.run.dir=/projects/surgical-video-digital-twin/new_results/act_peg_recover/lift3d_0106
+  hydra.run.dir=/projects/surgical-video-digital-twin/new_results/act_peg_recover/lift3d_kl1e-3_lr_1e-4 \
+  evaluation.num_skip_epochs=15 \

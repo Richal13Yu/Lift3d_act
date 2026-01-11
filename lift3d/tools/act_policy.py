@@ -26,13 +26,14 @@ And return either:
       "mu", "logvar" (for CVAE KL), "is_pad_hat" etc.
 
 Loss function (Hydra) is called as:
-  loss_result = loss_func(preds, actions, is_pad=is_pad)
+  loss_result = loss_func(preds, actions, is_pad=is_pad, kl_weight=kl_weight)
 and may return:
   - loss tensor
   - or (loss_tensor, metrics_dict)
 
-This file also supports adding KL from model output (e.g., ActOutput.kl or preds['kl'])
-with weight config.train.kl_weight (or config.agent.kl_weight fallback).
+IMPORTANT:
+  - This script NO LONGER adds any "extra KL" from model output.
+  - KL (and pad loss) should be handled inside the configured loss_func (e.g., lift3d/loss/act_vae_loss.py).
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ from hydra.utils import call, instantiate
 from omegaconf import OmegaConf
 from termcolor import colored
 
-from lift3d.envs import Evaluator
+from lift3d.envs.evaluator import Evaluator
 from lift3d.helpers.common import Logger, WandBLogger, set_seed
 from lift3d.helpers.pytorch import AverageMeter, log_params_to_file
 
@@ -109,42 +110,6 @@ def _get_actions_pred(preds) -> torch.Tensor:
         "or an object with attribute .actions/.a_hat. "
         f"Got type={type(preds)}"
     )
-
-
-def _get_kl_from_preds(preds) -> Optional[torch.Tensor]:
-    """
-    Robustly extract KL term from model output.
-    Supports:
-      - ActOutput dataclass/object with `.kl`
-      - dict with 'kl' / 'vae_kl' / 'kl_loss'
-    """
-    if preds is None:
-        return None
-
-    # dataclass / object style (e.g., ActOutput)
-    if hasattr(preds, "kl"):
-        kl = getattr(preds, "kl")
-        if torch.is_tensor(kl):
-            return kl
-        return None
-
-    # dict style
-    if isinstance(preds, dict):
-        for k in ("kl", "vae_kl", "kl_loss"):
-            if k in preds and torch.is_tensor(preds[k]):
-                return preds[k]
-    return None
-
-
-def _loss_dict_has_kl(loss_dict: Dict[str, Any]) -> bool:
-    """
-    If loss_func already reports KL-like metrics, we assume it already included KL
-    (avoid double-count).
-    """
-    keys = set(loss_dict.keys())
-    kl_like = {"kl", "vae_kl", "kl_loss", "kld", "kl_div", "kl_divergence"}
-    return any(k in keys for k in kl_like)
-
 
 @hydra.main(version_base=None, config_path="../config", config_name="train")
 def main(config):
@@ -294,7 +259,7 @@ def main(config):
     )
 
     # ----------------------------
-    # KL weight (ACT/DETR-VAE)
+    # KL weight (passed into loss_func if supported)
     # ----------------------------
     kl_weight = OmegaConf.select(config, "train.kl_weight", default=None)
     if kl_weight is None:
@@ -336,14 +301,20 @@ def main(config):
                 is_pad=is_pad,
             )
 
-            # Loss call (prefer passing is_pad when available)
+            # Loss call (prefer passing is_pad and kl_weight when available/supported)
             if is_pad is not None:
                 try:
-                    loss_result = call(config.benchmark.loss_func, preds, actions, is_pad=is_pad)
+                    loss_result = call(config.benchmark.loss_func, preds, actions, is_pad=is_pad, kl_weight=kl_weight)
+                except TypeError:
+                    try:
+                        loss_result = call(config.benchmark.loss_func, preds, actions, is_pad=is_pad)
+                    except TypeError:
+                        loss_result = call(config.benchmark.loss_func, preds, actions)
+            else:
+                try:
+                    loss_result = call(config.benchmark.loss_func, preds, actions, kl_weight=kl_weight)
                 except TypeError:
                     loss_result = call(config.benchmark.loss_func, preds, actions)
-            else:
-                loss_result = call(config.benchmark.loss_func, preds, actions)
 
             if isinstance(loss_result, tuple):
                 loss = loss_result[0]
@@ -353,21 +324,6 @@ def main(config):
                         iteration_info[f"train_interation/{k}"] = _to_item(v)
             else:
                 loss = loss_result
-
-            # ---- add KL (if model provides it and loss_func didn't already include it) ----
-            kl = _get_kl_from_preds(preds)
-            if kl_weight > 0.0 and kl is not None:
-                already_has_kl = False
-                if isinstance(loss_result, tuple):
-                    _, ld = loss_result
-                    if isinstance(ld, dict):
-                        already_has_kl = _loss_dict_has_kl(ld)
-
-                if not already_has_kl:
-                    loss = loss + kl_weight * kl
-                    iteration_info["train_interation/kl"] = _to_item(kl.detach())
-                    iteration_info["train_interation/kl_weight"] = kl_weight
-                    iteration_info["train_interation/loss_total_with_kl"] = _to_item(loss.detach())
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -419,30 +375,20 @@ def main(config):
                         is_pad=is_pad,
                     )
 
+                # Loss call (prefer passing is_pad and kl_weight when available/supported)
                 if is_pad is not None:
                     try:
-                        loss_result = call(config.benchmark.loss_func, preds, actions, is_pad=is_pad)
+                        loss_result = call(config.benchmark.loss_func, preds, actions, is_pad=is_pad, kl_weight=kl_weight)
+                    except TypeError:
+                        try:
+                            loss_result = call(config.benchmark.loss_func, preds, actions, is_pad=is_pad)
+                        except TypeError:
+                            loss_result = call(config.benchmark.loss_func, preds, actions)
+                else:
+                    try:
+                        loss_result = call(config.benchmark.loss_func, preds, actions, kl_weight=kl_weight)
                     except TypeError:
                         loss_result = call(config.benchmark.loss_func, preds, actions)
-                else:
-                    loss_result = call(config.benchmark.loss_func, preds, actions)
-
-                # ---- add KL for validation objective (consistent with training) ----
-                kl = _get_kl_from_preds(preds)
-                if kl_weight > 0.0 and kl is not None:
-                    already_has_kl = False
-                    if isinstance(loss_result, tuple):
-                        _, ld = loss_result
-                        if isinstance(ld, dict):
-                            already_has_kl = _loss_dict_has_kl(ld)
-
-                    if not already_has_kl:
-                        if isinstance(loss_result, tuple):
-                            loss_result = (loss_result[0] + kl_weight * kl, loss_result[1])
-                        else:
-                            loss_result = loss_result + kl_weight * kl
-                        epoch_logging_info["validation/kl"] = _to_item(kl.detach())
-                        epoch_logging_info["validation/kl_weight"] = kl_weight
 
                 if isinstance(loss_result, tuple):
                     loss_val.update(loss_result[0].item(), actions.shape[0])
