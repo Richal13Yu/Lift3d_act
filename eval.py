@@ -20,12 +20,16 @@ import matplotlib.pyplot as plt
 from hydra.utils import instantiate
 from termcolor import colored
 
+from scipy.ndimage import gaussian_filter1d
+
+from omegaconf import OmegaConf
+
 from lift3d.helpers.common import Logger, set_seed
 
 
-# ----------------------------
+# ============================================================
 # Logger compat
-# ----------------------------
+# ============================================================
 def _log_info(msg: str):
     if hasattr(Logger, "log_info"):
         Logger.log_info(msg)
@@ -47,9 +51,9 @@ def _print_sep():
         print("-" * 110)
 
 
-# ----------------------------
+# ============================================================
 # Batch helpers
-# ----------------------------
+# ============================================================
 def _unpack_item(
     item,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any, torch.Tensor, Any, Optional[torch.Tensor]]:
@@ -82,7 +86,6 @@ def _get_actions_pred(preds) -> torch.Tensor:
                 return preds[k]
         raise ValueError(f"Dict output has no tensor 'actions'/'a_hat'. keys={list(preds.keys())}")
 
-    # ActOutput / custom object
     for attr in ("actions", "a_hat", "action", "pred_actions", "actions_hat"):
         if hasattr(preds, attr):
             v = getattr(preds, attr)
@@ -179,9 +182,9 @@ def _scale_first_dims_torch(x: torch.Tensor, scale: float, pos_dim: int) -> torc
     return y
 
 
-# ----------------------------
+# ============================================================
 # Checkpoint helpers
-# ----------------------------
+# ============================================================
 def _strip_prefix_if_present(state_dict: Dict[str, torch.Tensor], prefixes=("module.", "model.")) -> Dict[str, torch.Tensor]:
     if not isinstance(state_dict, dict):
         return state_dict
@@ -208,6 +211,7 @@ def _resolve_checkpoint_path(ckpt_path: str) -> str:
 
 
 def _load_checkpoint(model: torch.nn.Module, ckpt_file: str) -> Dict[str, Any]:
+    # NOTE: keep default torch.load behavior for maximum compatibility with older ckpts
     obj = torch.load(ckpt_file, map_location="cpu")
 
     if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
@@ -235,9 +239,9 @@ def _load_checkpoint(model: torch.nn.Module, ckpt_file: str) -> Dict[str, Any]:
     }
 
 
-# ----------------------------
+# ============================================================
 # Episode indexing
-# ----------------------------
+# ============================================================
 @dataclass
 class EpisodeStep:
     episode_id: int
@@ -333,30 +337,142 @@ def _build_episode_index_map(dataset, episode_length_fallback: Optional[int]) ->
     return out
 
 
-# ----------------------------
-# Plot: continuous actions over an episode
-# ----------------------------
-def plot_trajectory_1episode(pred: np.ndarray, gt: np.ndarray, save_path: str, title: str):
+# ============================================================
+# Math: smoothing / rot6 / rollout
+# ============================================================
+def _maybe_smooth(x: np.ndarray, sigma: float) -> np.ndarray:
+    if sigma is None or sigma <= 0:
+        return x
+    return gaussian_filter1d(x, sigma=float(sigma), axis=0)
+
+
+def _rot6_to_mat(rot6: np.ndarray) -> np.ndarray:
     """
-    pred/gt: [T, A]
+    rot6: (..., 6) -> (..., 3, 3) via Gram-Schmidt
     """
-    T, A = pred.shape
+    a1 = rot6[..., 0:3]
+    a2 = rot6[..., 3:6]
+
+    b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-12)
+    proj = np.sum(b1 * a2, axis=-1, keepdims=True) * b1
+    b2 = a2 - proj
+    b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-12)
+
+    b3 = np.cross(b1, b2, axis=-1)
+
+    R = np.stack([b1, b2, b3], axis=-1)  # (...,3,3) columns
+    return R
+
+
+def _mat_to_rot6(R: np.ndarray) -> np.ndarray:
+    """
+    R: (...,3,3) -> (...,6) taking first two columns
+    """
+    c1 = R[..., :, 0]
+    c2 = R[..., :, 1]
+    return np.concatenate([c1, c2], axis=-1)
+
+
+def rollout_state_from_actions(
+    init_state: np.ndarray,
+    actions: np.ndarray,
+    pos_dim: int = 3,
+    rot6_slice: Tuple[int, int] = (3, 9),
+    gripper_idx: Optional[int] = 9,
+) -> np.ndarray:
+    """
+    Rollout state trajectory by applying delta actions sequentially.
+
+    Assumption:
+      state = [xyz(0:3), rot6(3:9), gripper(9)]  (dim=10)
+      action = [dxyz, drot6, dgrip]              (dim=10)
+      xyz_next = xyz + dxyz
+      R_next = R_current @ R_delta
+      gripper_next = gripper + dgrip
+    """
+    init_state = np.asarray(init_state, dtype=np.float32).copy()
+    actions = np.asarray(actions, dtype=np.float32)
+    T = actions.shape[0] + 1
+    D = init_state.shape[0]
+    out = np.zeros((T, D), dtype=np.float32)
+    out[0] = init_state
+
+    r0, r1 = rot6_slice
+    for t in range(T - 1):
+        s = out[t].copy()
+        a = actions[t]
+
+        s[:pos_dim] = s[:pos_dim] + a[:pos_dim]
+
+        if r1 > r0 and r1 <= D and r1 <= a.shape[0]:
+            R_cur = _rot6_to_mat(s[r0:r1])
+            R_dlt = _rot6_to_mat(a[r0:r1])
+            R_nxt = R_cur @ R_dlt
+            s[r0:r1] = _mat_to_rot6(R_nxt)
+
+        if gripper_idx is not None and gripper_idx < D and gripper_idx < a.shape[0]:
+            s[gripper_idx] = s[gripper_idx] + a[gripper_idx]
+
+        out[t + 1] = s
+
+    return out
+
+
+# ============================================================
+# Plotting utilities (many figures)
+# ============================================================
+def _dim_labels_default(dim: int) -> List[str]:
+    if dim == 10:
+        return [
+            "Position X", "Position Y", "Position Z",
+            "Rotation 1", "Rotation 2", "Rotation 3",
+            "Rotation 4", "Rotation 5", "Rotation 6",
+            "Gripper",
+        ]
+    return [f"Dim {i}" for i in range(dim)]
+
+
+def plot_series_pred_gt(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    save_path: str,
+    title: str,
+    labels: Optional[List[str]] = None,
+):
+    """
+    pred/gt: [T, D]
+    Robust: auto-align lengths (crop to min T).
+    """
+    pred = np.asarray(pred)
+    gt = np.asarray(gt)
+
+    if pred.ndim != 2 or gt.ndim != 2:
+        raise ValueError(f"Expected 2D arrays, got pred{pred.shape}, gt{gt.shape}")
+    D = min(pred.shape[1], gt.shape[1])
+    T = min(pred.shape[0], gt.shape[0])
+    pred = pred[:T, :D]
+    gt = gt[:T, :D]
+
+    if labels is None:
+        labels = _dim_labels_default(D)
+    else:
+        labels = labels[:D]
+
     t = np.arange(T)
 
-    fig, axes = plt.subplots(A, 1, figsize=(14, 2.2 * A), sharex=True)
-    if A == 1:
+    fig, axes = plt.subplots(D, 1, figsize=(14, 2.2 * D), sharex=True)
+    if D == 1:
         axes = [axes]
     fig.suptitle(title)
 
-    for i in range(A):
+    for i in range(D):
         ax = axes[i]
         ax.plot(t, pred[:, i], label="Predicted")
         ax.plot(t, gt[:, i], label="Ground Truth")
         mse = float(np.mean((pred[:, i] - gt[:, i]) ** 2))
         mae = float(np.mean(np.abs(pred[:, i] - gt[:, i])))
-        ax.set_title(f"MSE: {mse:.6f}, MAE: {mae:.6f}")
+        ax.set_title(f"{labels[i]} | MSE: {mse:.6f}, MAE: {mae:.6f}")
         ax.grid(True, alpha=0.3)
-        ax.set_ylabel(f"Action {i}")
         ax.legend(loc="upper right")
 
     axes[-1].set_xlabel("Timestep")
@@ -365,12 +481,315 @@ def plot_trajectory_1episode(pred: np.ndarray, gt: np.ndarray, save_path: str, t
     plt.close(fig)
 
 
-# ----------------------------
+def plot_series_error(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    save_path: str,
+    title: str,
+    labels: Optional[List[str]] = None,
+    abs_err: bool = False,
+):
+    pred = np.asarray(pred)
+    gt = np.asarray(gt)
+    if pred.ndim != 2 or gt.ndim != 2:
+        raise ValueError(f"Expected 2D arrays, got pred{pred.shape}, gt{gt.shape}")
+
+    D = min(pred.shape[1], gt.shape[1])
+    T = min(pred.shape[0], gt.shape[0])
+    pred = pred[:T, :D]
+    gt = gt[:T, :D]
+
+    t = np.arange(T)
+    if labels is None:
+        labels = _dim_labels_default(D)
+    else:
+        labels = labels[:D]
+
+    err = pred - gt
+    if abs_err:
+        err = np.abs(err)
+
+    fig, axes = plt.subplots(D, 1, figsize=(14, 2.2 * D), sharex=True)
+    if D == 1:
+        axes = [axes]
+    fig.suptitle(title)
+
+    for i in range(D):
+        ax = axes[i]
+        ax.plot(t, err[:, i], label="|Pred-GT|" if abs_err else "Pred-GT")
+        ax.set_title(labels[i])
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right")
+
+    axes[-1].set_xlabel("Timestep")
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_error_histograms(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    save_path: str,
+    title: str,
+    pos_dim: int = 3,
+    rot6_slice: Tuple[int, int] = (3, 9),
+    gripper_idx: Optional[int] = 9,
+):
+    pred = np.asarray(pred)
+    gt = np.asarray(gt)
+    if pred.ndim != 2 or gt.ndim != 2:
+        raise ValueError(f"Expected 2D arrays, got pred{pred.shape}, gt{gt.shape}")
+
+    D = min(pred.shape[1], gt.shape[1])
+    T = min(pred.shape[0], gt.shape[0])
+    pred = pred[:T, :D]
+    gt = gt[:T, :D]
+
+    err = pred - gt
+
+    groups = []
+    group_names = []
+
+    if pos_dim > 0 and D >= pos_dim:
+        groups.append(err[:, :pos_dim].reshape(-1))
+        group_names.append("xyz")
+
+    r0, r1 = rot6_slice
+    if r1 > r0 and D >= r1:
+        groups.append(err[:, r0:r1].reshape(-1))
+        group_names.append("rot6")
+
+    if gripper_idx is not None and D > gripper_idx:
+        groups.append(err[:, gripper_idx].reshape(-1))
+        group_names.append("gripper")
+
+    n = len(groups)
+    if n == 0:
+        _log_warn("[WARN] No valid groups for histogram; skip.")
+        return
+
+    fig, axes = plt.subplots(n, 1, figsize=(12, 3.2 * n))
+    if n == 1:
+        axes = [axes]
+    fig.suptitle(title)
+
+    for i, (g, name) in enumerate(zip(groups, group_names)):
+        ax = axes[i]
+        ax.hist(g, bins=80)
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f"{name} error hist | mean={float(np.mean(g)):.6f} std={float(np.std(g)):.6f}")
+        ax.set_xlabel("error")
+        ax.set_ylabel("count")
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_pose_3d_and_gripper(
+    pred_state: np.ndarray,
+    gt_state: np.ndarray,
+    save_prefix: str,
+    sample_freq: int = 10,
+    pos_dim: int = 3,
+    rot6_slice: Tuple[int, int] = (3, 9),
+    gripper_idx: Optional[int] = 9,
+):
+    pred_state = np.asarray(pred_state)
+    gt_state = np.asarray(gt_state)
+    if pred_state.ndim != 2 or gt_state.ndim != 2:
+        raise ValueError(f"Expected 2D arrays, got pred{pred_state.shape}, gt{gt_state.shape}")
+
+    T = min(len(pred_state), len(gt_state))
+    D = min(pred_state.shape[1], gt_state.shape[1])
+    pred_state = pred_state[:T, :D]
+    gt_state = gt_state[:T, :D]
+
+    if D < pos_dim:
+        _log_warn("[WARN] Not enough dims for 3D pose plot; skip.")
+        return
+
+    pred_pos = pred_state[:, :pos_dim]
+    gt_pos = gt_state[:, :pos_dim]
+
+    fig = plt.figure(figsize=(15, 10))
+    ax = fig.add_subplot(111, projection="3d")
+
+    colors_pred = plt.cm.Blues(np.linspace(0.3, 1, T))
+    colors_true = plt.cm.Reds(np.linspace(0.3, 1, T))
+
+    for i in range(T - 1):
+        ax.plot(pred_pos[i:i+2, 0], pred_pos[i:i+2, 1], pred_pos[i:i+2, 2], color=colors_pred[i], alpha=0.8)
+        ax.plot(gt_pos[i:i+2, 0], gt_pos[i:i+2, 1], gt_pos[i:i+2, 2], color=colors_true[i], alpha=0.8)
+
+    ax.scatter(pred_pos[0, 0], pred_pos[0, 1], pred_pos[0, 2], c="blue", marker="o", s=80, label="Pred Start")
+    ax.scatter(pred_pos[-1, 0], pred_pos[-1, 1], pred_pos[-1, 2], c="blue", marker="s", s=80, label="Pred End")
+    ax.scatter(gt_pos[0, 0], gt_pos[0, 1], gt_pos[0, 2], c="red", marker="o", s=80, label="GT Start")
+    ax.scatter(gt_pos[-1, 0], gt_pos[-1, 1], gt_pos[-1, 2], c="red", marker="s", s=80, label="GT End")
+
+    r0, r1 = rot6_slice
+    if r1 > r0 and D >= r1:
+        sample_idx = np.arange(0, T, max(1, int(sample_freq)))
+        scale = 0.02
+        for i in sample_idx:
+            p = pred_pos[i]
+            g = gt_pos[i]
+
+            Rp = _rot6_to_mat(pred_state[i, r0:r1])
+            vp1, vp2 = Rp[:, 0], Rp[:, 1]
+            ax.quiver(p[0], p[1], p[2], vp1[0], vp1[1], vp1[2], length=scale, color=colors_pred[i], alpha=0.35)
+            ax.quiver(p[0], p[1], p[2], vp2[0], vp2[1], vp2[2], length=scale, color=colors_pred[i], alpha=0.35)
+
+            Rg = _rot6_to_mat(gt_state[i, r0:r1])
+            vg1, vg2 = Rg[:, 0], Rg[:, 1]
+            ax.quiver(g[0], g[1], g[2], vg1[0], vg1[1], vg1[2], length=scale, color=colors_true[i], alpha=0.35)
+            ax.quiver(g[0], g[1], g[2], vg2[0], vg2[1], vg2[2], length=scale, color=colors_true[i], alpha=0.35)
+
+    pos_mse = float(np.mean((pred_pos - gt_pos) ** 2))
+    rot_mse = float(np.mean((pred_state[:, r0:r1] - gt_state[:, r0:r1]) ** 2)) if (r1 > r0 and D >= r1) else 0.0
+    ax.set_title(f"3D Pose Trajectory | Position MSE={pos_mse:.6f} | Rotation6D MSE={rot_mse:.6f}")
+    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+    ax.grid(True)
+    ax.legend(loc="best")
+
+    max_range = np.array([
+        pred_pos.max(0) - pred_pos.min(0),
+        gt_pos.max(0) - gt_pos.min(0)
+    ]).max() / 2.0
+    mid_x = (pred_pos[:, 0].mean() + gt_pos[:, 0].mean()) / 2
+    mid_y = (pred_pos[:, 1].mean() + gt_pos[:, 1].mean()) / 2
+    mid_z = (pred_pos[:, 2].mean() + gt_pos[:, 2].mean()) / 2
+    ax.set_xlim(mid_x - max_range, mid_x + max_range)
+    ax.set_ylim(mid_y - max_range, mid_y + max_range)
+    ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+    fig.savefig(save_prefix + "_trajectory3d.png", dpi=220)
+    plt.close(fig)
+
+    if gripper_idx is not None and D > gripper_idx:
+        fig2 = plt.figure(figsize=(12, 4))
+        ax2 = fig2.add_subplot(111)
+        ax2.plot(pred_state[:, gripper_idx], label="Predicted")
+        ax2.plot(gt_state[:, gripper_idx], label="Ground Truth")
+        ax2.set_title("Gripper Position")
+        ax2.set_xlabel("Timestep")
+        ax2.set_ylabel("Gripper")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc="best")
+        fig2.savefig(save_prefix + "_gripper.png", dpi=220)
+        plt.close(fig2)
+
+
+# ============================================================
+# KEY: Disable conditional prior at inference (force z=0)
+# ============================================================
+def _infer_latent_dim_from_config_or_model(config, model: torch.nn.Module) -> Optional[int]:
+    # 1) config paths (common names)
+    for path in [
+        "agent.instantiate_config.latent_dim",
+        "agent.instantiate_config.z_dim",
+        "agent.instantiate_config.latent_size",
+        "agent.latent_dim",
+        "agent.z_dim",
+    ]:
+        v = OmegaConf.select(config, path, default=None)
+        if v is not None:
+            try:
+                return int(v)
+            except Exception:
+                pass
+
+    # 2) model attributes
+    for attr in ["latent_dim", "z_dim", "latent_size", "nz", "dim_z"]:
+        if hasattr(model, attr):
+            try:
+                return int(getattr(model, attr))
+            except Exception:
+                pass
+
+    # 3) state_dict heuristic: look for a prior head with out_features=2*latent_dim
+    try:
+        sd = model.state_dict()
+        cand = []
+        for k, w in sd.items():
+            if not torch.is_tensor(w) or w.ndim != 2:
+                continue
+            name = k.lower()
+            if "prior" in name and "weight" in name:
+                cand.append((k, w.shape))
+        # pick the smallest "prior" linear
+        if cand:
+            cand.sort(key=lambda x: x[1][0])  # sort by out_features
+            out_features = int(cand[0][1][0])
+            # often prior outputs 2*latent_dim (mu+logvar)
+            if out_features % 2 == 0:
+                return out_features // 2
+    except Exception:
+        pass
+
+    return None
+
+
+def disable_conditional_prior_inference(model: torch.nn.Module, config) -> None:
+    """
+    Force inference (actions=None) to NOT depend on conditional prior.
+    Implementation:
+      - monkeypatch model._prior(global_d) to return mu=0, logvar=0
+      - force model.sample_prior=False (so z = mu = 0, not random)
+    This matches your old behavior (z=0) and avoids "conditional prior drift".
+    """
+    latent_dim = _infer_latent_dim_from_config_or_model(config, model)
+    if latent_dim is None:
+        _log_warn("[WARN] Could not infer latent_dim; cannot disable conditional prior safely. (Will keep original model behavior.)")
+        return
+
+    # turn off sampling from prior if the flag exists
+    if hasattr(model, "sample_prior"):
+        try:
+            setattr(model, "sample_prior", False)
+        except Exception:
+            pass
+
+    # patch _prior if present
+    if hasattr(model, "_prior") and callable(getattr(model, "_prior")):
+        def _prior_zero(global_d: torch.Tensor):
+            mu = torch.zeros((global_d.shape[0], latent_dim), device=global_d.device, dtype=global_d.dtype)
+            logvar = torch.zeros_like(mu)
+            return mu, logvar
+        try:
+            model._prior = _prior_zero  # type: ignore[attr-defined]
+            _log_info(f"[INFO] Disabled conditional prior: patched model._prior -> zeros (latent_dim={latent_dim}), sample_prior=False")
+            return
+        except Exception as e:
+            _log_warn(f"[WARN] Failed to patch model._prior: {e}")
+
+    # fallback: patch prior_net forward if exists
+    if hasattr(model, "prior_net") and isinstance(getattr(model, "prior_net"), torch.nn.Module):
+        prior_net = getattr(model, "prior_net")
+        orig_forward = prior_net.forward
+
+        def _forward_zero(x):
+            B = x.shape[0]
+            out = torch.zeros((B, 2 * latent_dim), device=x.device, dtype=x.dtype)
+            return out
+
+        try:
+            prior_net.forward = _forward_zero  # type: ignore[method-assign]
+            _log_info(f"[INFO] Disabled conditional prior: patched model.prior_net.forward -> zeros (latent_dim={latent_dim}), sample_prior=False")
+            return
+        except Exception as e:
+            _log_warn(f"[WARN] Failed to patch model.prior_net.forward: {e}")
+
+    _log_warn("[WARN] No _prior/prior_net found to patch. Conditional prior may still be used.")
+
+
+# ============================================================
 # Main
-# ----------------------------
+# ============================================================
 @hydra.main(version_base=None, config_path="lift3d/config", config_name="train")
 def main(config):
-    _log_info(f"[INFO] Eval ACT (episode-stitch, FULL-CHUNK) with {colored(pathlib.Path(__file__).absolute(), 'red')}")
+    _log_info(f"[INFO] Eval ACT (episode-stitch, FULL-CHUNK) + MANY PLOTS with {colored(pathlib.Path(__file__).absolute(), 'red')}")
     _log_info(f"[INFO] Task: {colored(config.task_name, 'green')}")
     _log_info(f"[INFO] Dataset dir: {colored(config.dataset_dir, 'green')}")
     _log_info(f"[INFO] Device: {colored(config.device, 'green')}")
@@ -390,24 +809,19 @@ def main(config):
     if ckpt_path is None:
         raise ValueError("Please provide checkpoint path via +evaluation.checkpoint_path=...")
 
-    # episode stitch controls
     episode_id = getattr(eval_cfg, "episode_id", None) if eval_cfg is not None else None
     episode_length = getattr(eval_cfg, "episode_length", None) if eval_cfg is not None else None
     max_steps = getattr(eval_cfg, "max_steps", None) if eval_cfg is not None else None
     eval_batch_size = int(getattr(eval_cfg, "eval_batch_size", 16)) if eval_cfg is not None else 16
-
-    # chunk_stride: how many dataset steps to advance between chunk predictions.
     chunk_stride_cfg = getattr(eval_cfg, "chunk_stride", None) if eval_cfg is not None else None
 
-    # -------- NEW: scaling controls --------
-    # If dataset does NOT already do scaling, we will apply `train_pos_scale` to rs/actions before model forward.
-    # Typical: train_pos_scale=1000.0 (m->mm)
     train_pos_scale = float(getattr(eval_cfg, "pos_scale", 1.0)) if eval_cfg is not None else 1.0
     pos_dim = int(getattr(eval_cfg, "pos_dim", 3)) if eval_cfg is not None else 3
-    # If True: output/plot/npz will unscale xyz back to meters (divide by 1000 when train_pos_scale=1000)
     unscale_to_meters = bool(getattr(eval_cfg, "unscale_to_meters", True)) if eval_cfg is not None else True
 
-    # deterministic
+    smooth_sigma = float(getattr(eval_cfg, "smooth_sigma", 0.0)) if eval_cfg is not None else 0.0
+    pose_sample_freq = int(getattr(eval_cfg, "pose_sample_freq", 10)) if eval_cfg is not None else 10
+
     torch.manual_seed(0)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(0)
@@ -417,7 +831,6 @@ def main(config):
     _log_info(f"[INFO] Split: {colored(split, 'green')}")
     _log_info(f"[INFO] eval_batch_size: {eval_batch_size}")
 
-    # dataset
     dataset = instantiate(
         config=config.benchmark.dataset_instantiate_config,
         data_dir=config.dataset_dir,
@@ -426,7 +839,6 @@ def main(config):
     if len(dataset) == 0:
         raise RuntimeError(f"Dataset split '{split}' is empty.")
 
-    # detect if dataset already scales xyz (e.g. ChunkDatasetWrapper(pos_scale=1000))
     dataset_pos_scale = None
     if hasattr(dataset, "pos_scale"):
         try:
@@ -435,22 +847,18 @@ def main(config):
             dataset_pos_scale = None
 
     if dataset_pos_scale is not None and dataset_pos_scale != 1.0:
-        # dataset already returns scaled rs/actions in model space
         scale_for_model = 1.0
         model_space_scale = dataset_pos_scale
         _log_info(f"[INFO] Detected dataset.pos_scale={dataset_pos_scale} -> assume rs/actions already scaled for model.")
     else:
-        # dataset returns original units; eval will scale to match training
         scale_for_model = train_pos_scale
         model_space_scale = train_pos_scale
         _log_info(f"[INFO] Dataset has no pos_scale; using evaluation.pos_scale={train_pos_scale} for model inputs/GT.")
 
-    # inverse: model space -> meters (for xyz only)
     inv_scale_for_plot = (1.0 / model_space_scale) if (unscale_to_meters and model_space_scale != 0.0) else 1.0
-
     _log_info(f"[INFO] pos_dim={pos_dim}, scale_for_model={scale_for_model}, model_space_scale={model_space_scale}, unscale_to_meters={unscale_to_meters}")
+    _log_info(f"[INFO] smooth_sigma={smooth_sigma}, pose_sample_freq={pose_sample_freq}")
 
-    # infer dims from first item
     it0 = dataset[0]
     images0, pc0, rs0, raw0, act0, txt0, pad0 = _unpack_item(it0)
 
@@ -473,7 +881,6 @@ def main(config):
     _log_info(f"[INFO] GT chunk len (from dataset[0]): {gt_chunk_len0}")
     _log_info(f"[INFO] chunk_stride: {chunk_stride}  (advance steps between chunks)")
 
-    # model
     model = instantiate(
         config=config.agent.instantiate_config,
         robot_state_dim=robot_state_dim,
@@ -484,7 +891,9 @@ def main(config):
     _log_info(f"[INFO] ckpt load summary: missing={ckpt_summary['missing_keys_count']}, unexpected={ckpt_summary['unexpected_keys_count']}")
     model.eval()
 
-    # build episode map
+    # >>> IMPORTANT: disable conditional prior for inference (force z=0) <<<
+    disable_conditional_prior_inference(model, config)
+
     ep_map = _build_episode_index_map(dataset, episode_length_fallback=episode_length)
     ep_ids = sorted(list(ep_map.keys()))
     if len(ep_ids) == 0:
@@ -515,14 +924,60 @@ def main(config):
     _log_info(f"[INFO] episode steps (dataset items): {len(idxs_all)} | using chunk starts: {len(idxs)}")
     _log_info(f"[INFO] step_id range: {step_min_ep} .. {step_max_ep}")
 
-    # We build continuous arrays by stitching FULL chunks
+    # ----------------------------
+    # Build GT state trajectory from dataset steps
+    # ----------------------------
+    gt_state_raw_list: List[np.ndarray] = []
+    gt_state_plot_list: List[np.ndarray] = []
+    gt_state_stepid_list: List[int] = []
+
+    for ds_idx in idxs_all:
+        epst = _index_to_episode_step(dataset, ds_idx, episode_length_fallback=episode_length)
+        item = dataset[ds_idx]
+        _, _, robot_states, _, _, _, _ = _unpack_item(item)
+
+        rs_t = robot_states if torch.is_tensor(robot_states) else torch.as_tensor(robot_states, dtype=torch.float32)
+        if rs_t.dim() == 2 and rs_t.shape[0] == 1:
+            rs_t = rs_t[0]
+        rs_np = rs_t.detach().cpu().numpy().astype(np.float32)
+
+        if rs_np.shape[0] < action_dim:
+            break
+
+        s_raw = rs_np[:action_dim].copy()
+        if scale_for_model != 1.0:
+            s_raw = _scale_first_dims(s_raw, scale_for_model, pos_dim)
+        if inv_scale_for_plot != 1.0:
+            s_plot = _scale_first_dims(s_raw, inv_scale_for_plot, pos_dim)
+        else:
+            s_plot = s_raw.copy()
+
+        gt_state_raw_list.append(s_raw)
+        gt_state_plot_list.append(s_plot)
+        gt_state_stepid_list.append(int(epst.step_id))
+
+    gt_state_available = (len(gt_state_raw_list) > 0 and gt_state_raw_list[0].shape[0] == action_dim)
+
+    if gt_state_available:
+        order_s = np.argsort(np.array(gt_state_stepid_list, dtype=np.int64))
+        gt_state_raw = np.stack([gt_state_raw_list[i] for i in order_s], axis=0)
+        gt_state_plot = np.stack([gt_state_plot_list[i] for i in order_s], axis=0)
+        gt_state_steps = np.array([gt_state_stepid_list[i] for i in order_s], dtype=np.int64)
+    else:
+        gt_state_raw = None
+        gt_state_plot = None
+        gt_state_steps = None
+        _log_warn("[WARN] Could not build GT state trajectory from robot_states (robot_state_dim < action_dim). Will skip state/3D plots.")
+
+    # ----------------------------
+    # Stitch FULL chunks into continuous action sequence
+    # ----------------------------
     pred_list_raw: List[np.ndarray] = []
     gt_list_raw: List[np.ndarray] = []
     pred_list_plot: List[np.ndarray] = []
     gt_list_plot: List[np.ndarray] = []
     step_id_list: List[int] = []
 
-    # batched inference buffers
     buf_imgs: List[torch.Tensor] = []
     buf_pcs: List[torch.Tensor] = []
     buf_rs: List[torch.Tensor] = []
@@ -544,24 +999,23 @@ def main(config):
         rs = torch.stack(buf_rs, dim=0).to(device)
         texts = _as_text_list(buf_txt, B)
 
-        # scale rs to match training, ONLY if dataset did not already do it
         if scale_for_model != 1.0:
             rs = _scale_first_dims_torch(rs, scale_for_model, pos_dim)
 
         with torch.no_grad():
+            # no actions passed -> inference path; we already patched conditional prior -> z=0
             preds_inf = model(imgs, pcs, rs, texts)
 
-        a_inf = _ensure_chunk(_get_actions_pred(preds_inf))      # [B,K,A]
-        a_inf_np = a_inf.detach().cpu().numpy()                  # model space (scaled)
+        a_inf = _ensure_chunk(_get_actions_pred(preds_inf))  # [B,K,A]
+        a_inf_np = a_inf.detach().cpu().numpy()              # model space
 
         for bi in range(B):
             start_step = int(buf_stepid[bi])
-            pred_chunk = a_inf_np[bi]                            # [K_pred,A] in model space
+            pred_chunk = a_inf_np[bi]                        # [K_pred,A] model space
 
             gt_chunk_t = buf_gt_chunk[bi]
             gt_chunk = _ensure_chunk(gt_chunk_t)[0].detach().cpu().numpy()  # [K_gt,A] dataset space
 
-            # scale GT to model space if needed (dataset didn't scale)
             if scale_for_model != 1.0:
                 gt_chunk = _scale_first_dims(gt_chunk, scale_for_model, pos_dim)
 
@@ -601,7 +1055,7 @@ def main(config):
     for ds_idx in idxs:
         epst = _index_to_episode_step(dataset, ds_idx, episode_length_fallback=episode_length)
         item = dataset[ds_idx]
-        images, point_clouds, robot_states, raw_states, actions, texts, is_pad = _unpack_item(item)
+        images, point_clouds, robot_states, _, actions, texts, is_pad = _unpack_item(item)
 
         img_t = images if torch.is_tensor(images) else torch.as_tensor(images, dtype=torch.float32)
         pc_t = point_clouds if torch.is_tensor(point_clouds) else torch.as_tensor(point_clouds, dtype=torch.float32)
@@ -636,22 +1090,23 @@ def main(config):
     pred_raw = np.stack([pred_list_raw[i] for i in order], axis=0)
     gt_raw = np.stack([gt_list_raw[i] for i in order], axis=0)
 
-    pred = np.stack([pred_list_plot[i] for i in order], axis=0)
-    gt = np.stack([gt_list_plot[i] for i in order], axis=0)
+    pred_plot = np.stack([pred_list_plot[i] for i in order], axis=0)
+    gt_plot = np.stack([gt_list_plot[i] for i in order], axis=0)
 
     steps = np.array([step_id_list[i] for i in order], dtype=np.int64)
 
-    T = pred.shape[0]
-    _log_info(f"[INFO] Built stitched FULL-CHUNK trajectory: T={T}, A={pred.shape[1]}")
+    pred_plot_s = _maybe_smooth(pred_plot, smooth_sigma)
+    gt_plot_s = _maybe_smooth(gt_plot, smooth_sigma)
+
+    T = pred_plot.shape[0]
+    _log_info(f"[INFO] Built stitched FULL-CHUNK action trajectory: T={T}, A={pred_plot.shape[1]}")
     _log_info(f"[INFO] stitched step_id range: {int(steps.min())} .. {int(steps.max())}")
 
-    # metrics (raw/model-space)
     mse_raw = float(np.mean((pred_raw - gt_raw) ** 2))
     mae_raw = float(np.mean(np.abs(pred_raw - gt_raw)))
 
-    # metrics (plot-space: if unscale_to_meters=True, xyz is meters)
-    mse_plot = float(np.mean((pred - gt) ** 2))
-    mae_plot = float(np.mean(np.abs(pred - gt)))
+    mse_plot = float(np.mean((pred_plot - gt_plot) ** 2))
+    mae_plot = float(np.mean(np.abs(pred_plot - gt_plot)))
 
     _log_info(f"[EPISODE][RAW/model-space] MSE={mse_raw:.6f}  MAE={mae_raw:.6f}")
     if unscale_to_meters:
@@ -659,25 +1114,144 @@ def main(config):
     else:
         _log_info(f"[EPISODE][PLOT same as raw] MSE={mse_plot:.6f}  MAE={mae_plot:.6f}")
 
-    # plot
-    fig_path = out_dir / f"episode_{chosen_ep}_actions_pred_vs_gt_FULLCHUNK.png"
+    # ============================================================
+    # MANY PLOTS (actions)
+    # ============================================================
+    labels = _dim_labels_default(pred_plot.shape[1])
     unit_note = "xyz in meters" if unscale_to_meters else "xyz in model-space"
-    plot_trajectory_1episode(
-        pred, gt,
-        save_path=str(fig_path),
-        title=f"Pred vs GT (FULL CHUNK STITCH) | {unit_note} | task={config.task_name} | split={split} | episode={chosen_ep} | T={T} | stride={chunk_stride}"
-    )
-    _log_info(f"[OK] Saved plot: {colored(str(fig_path), 'green')}")
 
-    # save npz (save both raw and plot arrays)
-    npz_path = out_dir / f"episode_{chosen_ep}_actions_pred_vs_gt_FULLCHUNK.npz"
+    fig_actions = out_dir / f"episode_{chosen_ep}_ACTIONS_pred_vs_gt.png"
+    plot_series_pred_gt(
+        pred_plot_s, gt_plot_s,
+        save_path=str(fig_actions),
+        title=f"Actions Pred vs GT | {unit_note} | task={config.task_name} | split={split} | episode={chosen_ep} | T={T} | stride={chunk_stride}",
+        labels=labels,
+    )
+    _log_info(f"[OK] Saved: {colored(str(fig_actions), 'green')}")
+
+    fig_err = out_dir / f"episode_{chosen_ep}_ACTIONS_error_pred_minus_gt.png"
+    plot_series_error(
+        pred_plot_s, gt_plot_s,
+        save_path=str(fig_err),
+        title=f"Actions Error (Pred-GT) | {unit_note} | episode={chosen_ep}",
+        labels=labels,
+        abs_err=False,
+    )
+    _log_info(f"[OK] Saved: {colored(str(fig_err), 'green')}")
+
+    fig_abserr = out_dir / f"episode_{chosen_ep}_ACTIONS_abs_error.png"
+    plot_series_error(
+        pred_plot_s, gt_plot_s,
+        save_path=str(fig_abserr),
+        title=f"Actions |Abs Error| | {unit_note} | episode={chosen_ep}",
+        labels=labels,
+        abs_err=True,
+    )
+    _log_info(f"[OK] Saved: {colored(str(fig_abserr), 'green')}")
+
+    fig_hist = out_dir / f"episode_{chosen_ep}_ACTIONS_error_hist.png"
+    plot_error_histograms(
+        pred_plot, gt_plot,
+        save_path=str(fig_hist),
+        title=f"Actions Error Histograms | {unit_note} | episode={chosen_ep}",
+        pos_dim=pos_dim,
+        rot6_slice=(3, 9) if pred_plot.shape[1] >= 9 else (0, 0),
+        gripper_idx=9 if pred_plot.shape[1] > 9 else None,
+    )
+    _log_info(f"[OK] Saved: {colored(str(fig_hist), 'green')}")
+
+    # ============================================================
+    # State trajectory plots (rollout) — FIXED LENGTH ALIGNMENT
+    # ============================================================
+    pred_state_raw = None
+    pred_state_plot = None
+    pred_state_steps = None
+
+    if gt_state_available and gt_state_raw is not None and gt_state_plot is not None and gt_state_steps is not None:
+        step_to_action_idx = {int(s): i for i, s in enumerate(steps.tolist())}
+
+        common_steps = [int(s) for s in gt_state_steps.tolist() if int(s) in step_to_action_idx]
+        common_steps.sort()
+
+        if len(common_steps) >= 1:
+            start_step = common_steps[0]
+            gt_start_i = int(np.where(gt_state_steps == start_step)[0][0])
+            act_start_i = step_to_action_idx[start_step]
+
+            remaining_gt = int(gt_state_raw.shape[0] - gt_start_i)
+            if remaining_gt <= 1:
+                _log_warn("[WARN] Not enough GT state remaining to rollout; skip state plots.")
+            else:
+                max_actions = remaining_gt - 1
+                actions_for_rollout_raw = pred_raw[act_start_i: act_start_i + max_actions]  # <= max_actions
+
+                init_s_raw = gt_state_raw[gt_start_i].copy()
+
+                pred_state_raw = rollout_state_from_actions(
+                    init_state=init_s_raw,
+                    actions=actions_for_rollout_raw,
+                    pos_dim=pos_dim,
+                    rot6_slice=(3, 9) if action_dim >= 9 else (0, 0),
+                    gripper_idx=9 if action_dim > 9 else None,
+                )
+
+                L = int(pred_state_raw.shape[0])
+                gt_state_raw_seg = gt_state_raw[gt_start_i: gt_start_i + L]
+                gt_state_plot_seg = gt_state_plot[gt_start_i: gt_start_i + L]
+
+                if inv_scale_for_plot != 1.0:
+                    pred_state_plot = pred_state_raw.copy()
+                    pred_state_plot[:, :pos_dim] *= inv_scale_for_plot
+                else:
+                    pred_state_plot = pred_state_raw.copy()
+
+                pred_state_plot_s = _maybe_smooth(pred_state_plot, smooth_sigma)
+                gt_state_plot_s = _maybe_smooth(gt_state_plot_seg, smooth_sigma)
+                pred_state_steps = gt_state_steps[gt_start_i: gt_start_i + L]
+
+                fig_state = out_dir / f"episode_{chosen_ep}_STATE_pred_vs_gt.png"
+                plot_series_pred_gt(
+                    pred_state_plot_s, gt_state_plot_s,
+                    save_path=str(fig_state),
+                    title=f"State Trajectory Pred vs GT (rollout from actions) | {unit_note} | episode={chosen_ep} | T={pred_state_plot_s.shape[0]}",
+                    labels=_dim_labels_default(min(action_dim, pred_state_plot_s.shape[1])),
+                )
+                _log_info(f"[OK] Saved: {colored(str(fig_state), 'green')}")
+
+                save_prefix = str(out_dir / f"episode_{chosen_ep}_POSE")
+                plot_pose_3d_and_gripper(
+                    pred_state_plot_s, gt_state_plot_s,
+                    save_prefix=save_prefix,
+                    sample_freq=pose_sample_freq,
+                    pos_dim=pos_dim,
+                    rot6_slice=(3, 9) if action_dim >= 9 else (0, 0),
+                    gripper_idx=9 if action_dim > 9 else None,
+                )
+                _log_info(f"[OK] Saved: {colored(save_prefix + '_trajectory3d.png', 'green')}")
+                if action_dim > 9:
+                    _log_info(f"[OK] Saved: {colored(save_prefix + '_gripper.png', 'green')}")
+        else:
+            _log_warn("[WARN] No overlapping steps between GT state steps and stitched action steps; skip state plots.")
+
+    # ============================================================
+    # Save NPZ
+    # ============================================================
+    npz_path = out_dir / f"episode_{chosen_ep}_FULLPLOTS_eval_outputs.npz"
     np.savez_compressed(
         str(npz_path),
-        pred_plot=pred,
-        gt_plot=gt,
+        pred_plot=pred_plot,
+        gt_plot=gt_plot,
+        pred_plot_s=pred_plot_s,
+        gt_plot_s=gt_plot_s,
         pred_raw=pred_raw,
         gt_raw=gt_raw,
         step_id=steps,
+        pred_state_raw=pred_state_raw if pred_state_raw is not None else np.zeros((0, action_dim), dtype=np.float32),
+        pred_state_plot=pred_state_plot if pred_state_plot is not None else np.zeros((0, action_dim), dtype=np.float32),
+        pred_state_step_id=pred_state_steps if pred_state_steps is not None else np.zeros((0,), dtype=np.int64),
+        gt_state_raw=gt_state_raw if gt_state_raw is not None else np.zeros((0, action_dim), dtype=np.float32),
+        gt_state_plot=gt_state_plot if gt_state_plot is not None else np.zeros((0, action_dim), dtype=np.float32),
+        gt_state_step_id=gt_state_steps if gt_state_steps is not None else np.zeros((0,), dtype=np.int64),
         episode_id=int(chosen_ep),
         split=split,
         checkpoint=str(ckpt_file),
@@ -685,17 +1259,18 @@ def main(config):
         pos_dim=int(pos_dim),
         model_space_scale=float(model_space_scale),
         unscale_to_meters=bool(unscale_to_meters),
+        inv_scale_for_plot=float(inv_scale_for_plot),
+        smooth_sigma=float(smooth_sigma),
     )
     _log_info(f"[OK] Saved npz: {colored(str(npz_path), 'green')}")
 
-    # summary json
     summary = {
         "task": config.task_name,
         "split": split,
         "checkpoint": str(ckpt_file),
         "episode_id": int(chosen_ep),
-        "T": int(T),
-        "A": int(pred.shape[1]),
+        "T_actions": int(T),
+        "A": int(pred_plot.shape[1]),
         "metrics": {
             "mse_raw": mse_raw,
             "mae_raw": mae_raw,
@@ -719,14 +1294,20 @@ def main(config):
             "unscale_to_meters": bool(unscale_to_meters),
             "inv_scale_for_plot": float(inv_scale_for_plot),
         },
+        "plots": {
+            "smooth_sigma": float(smooth_sigma),
+            "pose_sample_freq": int(pose_sample_freq),
+        },
         "params": {
             "eval_batch_size": int(eval_batch_size),
             "episode_length_fallback": None if episode_length is None else int(episode_length),
             "max_steps": None if max_steps is None else int(max_steps),
             "chunk_stride": int(chunk_stride),
         },
+        "state_plots_enabled": bool(gt_state_available),
+        "inference_latent": "forced_zero (conditional prior disabled)",
     }
-    out_json = out_dir / "eval_episode_stitch_summary_FULLCHUNK.json"
+    out_json = out_dir / "eval_episode_stitch_summary_FULLPLOTS.json"
     with open(out_json, "w") as f:
         json.dump(summary, f, indent=2)
     _log_info(f"[OK] Saved summary json: {colored(str(out_json), 'green')}")
