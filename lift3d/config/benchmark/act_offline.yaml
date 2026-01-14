@@ -29,7 +29,7 @@ evaluator_instantiate_config:
   data_dir: ${dataset_dir}
   dataset_instantiate_config: ${benchmark.dataset_instantiate_config}
 
-  split: train
+  split: validation
   episode_length: 700
   max_episode_length: null
 

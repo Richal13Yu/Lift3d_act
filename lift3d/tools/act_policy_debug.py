@@ -512,9 +512,11 @@ def main(config):
         lr=float(config.train.learning_rate),
         weight_decay=float(getattr(config.train, "weight_decay", 0.0)),
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=int(config.train.num_epochs), eta_min=float(getattr(config.train, "eta_min", 0.0))
-    )
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer, T_max=int(config.train.num_epochs), eta_min=float(getattr(config.train, "eta_min", 0.0))
+    # )
+
+    scheduler = None
 
     kl_weight = float(getattr(config.train, "kl_weight", 0.0))
 
@@ -595,7 +597,7 @@ def main(config):
                     "iteration_step": cur_epoch * len(train_loader) + cur_iter + 1,
                     "train_interation/epoch": cur_epoch,
                     "train_interation/loss": float(loss.item()),
-                    "train_interation/learning_rate": float(scheduler.get_last_lr()[0]),
+                    "train_interation/learning_rate": float((optimizer.param_groups[0]["lr"])),
                 }
                 for k, v in loss_dict.items():
                     iteration_info[f"train_interation/{k}"] = _to_item(v)
@@ -614,7 +616,7 @@ def main(config):
                             "epoch": int(cur_epoch),
                             "iter_in_epoch": int(cur_iter),
                             "global_iter": int(global_iter),
-                            "lr": float(scheduler.get_last_lr()[0]),
+                            "lr": float(optimizer.param_groups[0]["lr"]),
                             "loss": float(loss.item()),
                             "pad_ratio": pad_ratio,
                             "gt_stats": _safe_stats(actions_.float()),
@@ -641,7 +643,7 @@ def main(config):
                             msg += "BAD_PRED "
                         _log_info(msg)
 
-            scheduler.step()
+            # scheduler.step()
             _log_info(f"[train] epoch={cur_epoch} epoch_loss={loss_train.avg}")
 
             # epoch summary jsonl

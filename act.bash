@@ -19,7 +19,8 @@ python -m lift3d.tools.act_policy \
   benchmark=act_offline \
   agent=lift3d_act \
   task_name=peg_recover \
-  dataloader.batch_size=2 \
-  dataset_dir=/projects/surgical-video-digital-twin/datasets/act_peg_recover/1216/zarr_first2eps \
-  hydra.run.dir=/projects/surgical-video-digital-twin/new_results/act_peg_recover/lift3d_eval_test2/ \
+  dataloader.batch_size=16 dataloader.num_workers=16 dataloader.shuffle=true \
+  train.num_epochs=10000 train.learning_rate=1e-5 train.kl_weight=0 \
+  dataset_dir=/projects/surgical-video-digital-twin/datasets/act_peg_recover/1216/zarr \
+  hydra.run.dir=/projects/surgical-video-digital-twin/new_results/act_peg_recover/3dact_lr1e-6_kl0 \
   evaluation.num_skip_epochs=15 \
