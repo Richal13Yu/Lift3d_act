@@ -1,6 +1,6 @@
 name: Lift3D_ActActor
 instantiate_config:
-  _target_: lift3d.models.act_actor.Lift3DActActor
+  _target_: lift3d.models.act_actor_nomal.Lift3DActActor
 
   # Encoders
   point_cloud_encoder:

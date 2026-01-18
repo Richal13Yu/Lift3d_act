@@ -171,6 +171,16 @@ class ChunkDatasetWrapper(Dataset):
             raise AttributeError
         return getattr(self.base, name)
 
+    # ---- compat for eval.py ----
+    def index_to_episode_step(self, index: int):
+        """Return (episode_id, step_id) for a global index. Compat with eval.py."""
+        epst = self.index_to_ep_step(index)
+        return int(epst.episode_id), int(epst.step_id)
+
+    def get_episode_step(self, index: int):
+        """Alias of index_to_episode_step (some code paths look for this name)."""
+        return self.index_to_episode_step(index)
+
     # ---------- episode/step inference ----------
 
     def _infer_from_raw_states(self, index: int) -> EpisodeStep:

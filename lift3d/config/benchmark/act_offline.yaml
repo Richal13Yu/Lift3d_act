@@ -14,7 +14,7 @@ dataset_instantiate_config:
   pad: true
   pad_value: 0.0
 
-  pos_scale: 1000.0
+  pos_scale: 1000
   pos_dim: 3
 
   # one episode has 700 frames in your peg_recover dataset

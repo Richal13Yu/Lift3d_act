@@ -14,10 +14,10 @@ export WANDB_CONFIG_DIR="$WANDB_ROOT/config"
 # 可选：避免 wandb 再去碰 ~ 下面的 cache（有些环境会用到 XDG）
 export XDG_CACHE_HOME="$WANDB_ROOT/cache"
 export PYTHONPATH=$PWD/third_party:$PYTHONPATH
-python -m lift3d.tools.act_policy \
+python -m lift3d.tools.act_policy_normal \
   --config-name=train_recover \
   benchmark=act_offline \
-  agent=lift3d_act \
+  agent=lift3d_act_normal \
   task_name=peg_recover \
   dataloader.batch_size=16 dataloader.num_workers=8 dataloader.shuffle=true \
   train.num_epochs=10000 train.learning_rate=1e-5 train.kl_weight=10 \
